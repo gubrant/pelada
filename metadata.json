@@ -1,0 +1,6 @@
+{
+  "name": "QuadraMestre — Controle de Pelada e Futsal",
+  "description": "Sistema completo de gestão de peladas de futebol de salão, separação de times, placar de vitórias, temporadas, estatísticas e avaliações em 7 critérios.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
