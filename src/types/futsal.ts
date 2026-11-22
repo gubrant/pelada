@@ -393,32 +393,6 @@ export interface PlayerHistoryResponse {
   }>;
 }
 
-export interface InviteEmailRecord {
-  id: number;
-  userId: number;
-  playerId: number | null;
-  groupId?: number | null;
-  invitedByUserId?: number | null;
-  avulsoFee?: number | null;
-  toEmail: string;
-  subject: string;
-  bodyText: string;
-  inviteLink: string;
-  status: string;
-  createdAt: string;
-}
-
-export interface PasswordResetEmailRecord {
-  id: number;
-  userId: number;
-  toEmail: string;
-  subject: string;
-  bodyText: string;
-  resetLink: string;
-  status: string;
-  createdAt: string;
-}
-
 export interface AdminUserAccount {
   id: number;
   uid: string;
@@ -427,7 +401,6 @@ export interface AdminUserAccount {
   role: UserRole;
   active: boolean;
   hasPassword: boolean;
-  hasPendingInvite: boolean;
   createdAt: string;
   player: { id: number; nickname: string } | null;
 }
@@ -578,25 +551,7 @@ export interface PeladaParticipantPayment {
   confirmedByRole: string | null;
   notes: string | null;
   attachmentUrl: string | null;
-  pixEmailSentAt: string | null;
   createdAt: string;
-}
-
-export interface PeladaPixPaymentEmail {
-  id: number;
-  groupId: number;
-  peladaId: number | null;
-  paymentId: number | null;
-  userId: number | null;
-  playerId: number;
-  playerNickname?: string | null;
-  toEmail: string;
-  subject: string;
-  bodyText: string;
-  pixKey: string;
-  amount: number;
-  status: string;
-  sentAt: string;
 }
 
 export interface PeladaFinanceSummary {
@@ -629,7 +584,6 @@ export interface PeladaFinanceOverviewResponse {
   summary: PeladaFinanceSummary;
   entries: PeladaFinanceEntry[];
   payments: PeladaParticipantPayment[];
-  pixEmails: PeladaPixPaymentEmail[];
   peladas: Array<{
     id: number;
     title: string;

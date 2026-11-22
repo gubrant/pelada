@@ -4,18 +4,14 @@ import { and, desc, eq, inArray, isNotNull, isNull, or, sql } from 'drizzle-orm'
 import { db } from '../db/index.ts';
 import {
   adminNotifications,
-  inviteEmails,
   matchEvents,
   matches,
-  passwordResetEmails,
-  passwordResetTokens,
   peladaAttendances,
   peladaFinanceEntries,
   peladaGroupMembers,
   peladaGroups,
   peladaJoinRequests,
   peladaParticipantPayments,
-  peladaPixPaymentEmails,
   peladaTeams,
   peladas,
   playerEvaluations,
@@ -26,10 +22,7 @@ import {
   users,
 } from '../db/schema.ts';
 import {
-  generateInviteToken,
-  generateResetToken,
   hashPassword,
-  hashResetToken,
   signSessionToken,
   verifyPassword,
 } from '../lib/auth-crypto.ts';
@@ -111,24 +104,6 @@ function sanitizeImageUrl(url: unknown): string | null {
     return trimmed.slice(0, 600000);
   }
   return null;
-}
-
-function getBaseAppUrl(req: Pick<AuthRequest, 'headers' | 'protocol'>): string {
-  const configured = process.env.APP_URL?.trim();
-  if (configured && configured.startsWith('http') && !configured.includes('MY_APP_URL')) {
-    return configured.replace(/\/$/, '');
-  }
-  const rawProto = String(req.headers['x-forwarded-proto'] || req.protocol || 'http')
-    .split(',')[0]
-    .trim()
-    .toLowerCase();
-  const proto = rawProto === 'https' ? 'https' : 'http';
-  const rawHost = String(req.headers['x-forwarded-host'] || req.headers.host || 'localhost:3000')
-    .split(',')[0]
-    .trim()
-    .replace(/[^a-zA-Z0-9.:-]/g, '');
-  const host = rawHost || 'localhost:3000';
-  return `${proto}://${host}`;
 }
 
 async function sendTransactionalEmail(params: {
@@ -627,15 +602,27 @@ async function generateSummaryEmailForEventualMember(
         )
         .limit(1);
 
+  const resolvedToEmail = toEmail || existingEmail[0]?.toEmail || '';
+  const canSendRealEmail =
+    resolvedToEmail.includes('@') && !resolvedToEmail.endsWith('.local');
+  const deliveryStatus: 'sent' | 'queued' = canSendRealEmail
+    ? await sendTransactionalEmail({
+        toEmail: resolvedToEmail,
+        subject,
+        bodyText,
+      })
+    : 'queued';
+
   let emailRecord: typeof playerSummaryEmails.$inferSelect;
   if (existingEmail.length > 0) {
     const updated = await db
       .update(playerSummaryEmails)
       .set({
-        toEmail: toEmail || existingEmail[0].toEmail,
+        toEmail: resolvedToEmail || existingEmail[0].toEmail,
         subject,
         bodyText,
         statsJson,
+        status: deliveryStatus,
         sentAt: new Date(),
       })
       .where(eq(playerSummaryEmails.id, existingEmail[0].id))
@@ -649,11 +636,11 @@ async function generateSummaryEmailForEventualMember(
         peladaId: targetPeladaId,
         userId: memberRow.userId ?? player.userId ?? null,
         playerId: player.id,
-        toEmail: toEmail || 'sem-email@quadramestre.local',
+        toEmail: resolvedToEmail || 'sem-email@quadramestre.local',
         subject,
         bodyText,
         statsJson,
-        status: 'sent',
+        status: deliveryStatus,
       })
       .returning();
     emailRecord = inserted[0];
@@ -826,58 +813,45 @@ async function syncUserPlayerGroupLinks(userId: number, playerId: number) {
 }
 
 // ==========================================
-// AUTHENTICATION & INVITE ONBOARDING
+// AUTHENTICATION (LOGIN & CADASTRO DIRETO)
 // ==========================================
 
-apiRouter.get('/auth/bootstrap-status', async (_req, res) => {
+apiRouter.post('/auth/register', async (req, res) => {
   try {
-    const adminsWithPassword = await db
-      .select({ id: users.id })
-      .from(users)
-      .where(and(eq(users.role, 'admin'), sql`${users.passwordHash} IS NOT NULL`))
-      .limit(1);
+    const email = String(req.body?.email ?? '').trim().toLowerCase();
+    const password = String(req.body?.password ?? '');
+    const rawName = String(req.body?.name ?? '').trim();
 
-    res.json({ needsAdminPasswordSetup: adminsWithPassword.length === 0 });
-  } catch (error) {
-    console.error('Erro ao verificar status inicial:', error);
-    res.status(500).json({ error: 'Erro ao verificar estado do sistema.' });
-  }
-});
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 180) {
+      return res.status(400).json({ error: 'Informe um e-mail válido para criar seu login.' });
+    }
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'A senha deve ter no mínimo 6 dígitos.' });
+    }
 
-apiRouter.post('/auth/bootstrap-admin', async (req, res) => {
-  try {
-    const existingAdminWithPwd = await db
-      .select({ id: users.id })
-      .from(users)
-      .where(and(eq(users.role, 'admin'), sql`${users.passwordHash} IS NOT NULL`))
-      .limit(1);
-
-    if (existingAdminWithPwd.length > 0) {
-      return res.status(403).json({
-        error: 'Administrador já configurado. Use a tela de login normalmente.',
+    const existing = await db.select().from(users).where(eq(users.email, email)).limit(1);
+    if (existing.length > 0 && existing[0].passwordHash) {
+      return res.status(409).json({
+        error: 'Este e-mail já possui um login cadastrado. Utilize a tela de entrada.',
       });
     }
 
-    const email = String(req.body?.email ?? '').trim().toLowerCase();
-    const name = String(req.body?.name ?? '').trim() || 'Administrador';
-    const password = String(req.body?.password ?? '');
-
-    if (!email || !email.includes('@')) {
-      return res.status(400).json({ error: 'Informe um e-mail válido.' });
-    }
-    if (password.length < 6) {
-      return res.status(400).json({ error: 'A senha deve ter no mínimo 6 caracteres.' });
-    }
-
+    const name = rawName || email.split('@')[0].slice(0, 60) || 'Peladeiro';
     const passwordHash = await hashPassword(password);
-    const existingUser = await db.select().from(users).where(eq(users.email, email)).limit(1);
 
     let savedUser: typeof users.$inferSelect;
-    if (existingUser.length > 0) {
+    if (existing.length > 0) {
       const updated = await db
         .update(users)
-        .set({ passwordHash, role: 'admin', name, active: true })
-        .where(eq(users.id, existingUser[0].id))
+        .set({
+          name: rawName || existing[0].name || name,
+          passwordHash,
+          inviteToken: null,
+          inviteExpiresAt: null,
+          mustChangePassword: false,
+          active: true,
+        })
+        .where(eq(users.id, existing[0].id))
         .returning();
       savedUser = updated[0];
     } else {
@@ -888,35 +862,42 @@ apiRouter.post('/auth/bootstrap-admin', async (req, res) => {
           email,
           name,
           passwordHash,
-          role: 'admin',
+          role: 'player',
           active: true,
         })
         .returning();
       savedUser = inserted[0];
     }
 
+    const linkedPlayers = await db
+      .select()
+      .from(players)
+      .where(eq(players.userId, savedUser.id))
+      .limit(1);
+
+    const role = savedUser.role === 'admin' ? 'admin' : 'player';
     const token = signSessionToken({
       userId: savedUser.id,
       uid: savedUser.uid,
       email: savedUser.email,
-      role: 'admin',
+      role,
     });
 
-    res.json({
+    res.status(201).json({
       token,
       user: {
         id: savedUser.id,
         uid: savedUser.uid,
         email: savedUser.email,
         name: savedUser.name,
-        role: 'admin',
-        playerId: null,
+        role,
+        playerId: linkedPlayers[0]?.id ?? null,
       },
-      player: null,
+      player: linkedPlayers[0] ?? null,
     });
   } catch (error) {
-    console.error('Erro no cadastro inicial de admin:', error);
-    res.status(500).json({ error: 'Falha ao configurar administrador.' });
+    console.error('Erro ao criar login e senha:', error);
+    res.status(500).json({ error: 'Não foi possível criar seu acesso.' });
   }
 });
 
@@ -937,7 +918,7 @@ apiRouter.post('/auth/login', async (req, res) => {
     const user = found[0];
     if (!user.passwordHash) {
       return res.status(401).json({
-        error: 'Esta conta ainda não possui senha definida. Entre com Google ou use o link de convite.',
+        error: 'Esta conta ainda não possui senha definida. Crie uma senha ou peça a um administrador.',
       });
     }
 
@@ -975,368 +956,6 @@ apiRouter.post('/auth/login', async (req, res) => {
   } catch (error) {
     console.error('Erro ao realizar login:', error);
     res.status(500).json({ error: 'Erro interno ao autenticar.' });
-  }
-});
-
-apiRouter.post('/auth/forgot-password', async (req, res) => {
-  try {
-    const email = String(req.body?.email ?? '').trim().toLowerCase();
-    if (!email || !email.includes('@')) {
-      return res.status(400).json({ error: 'Informe um e-mail válido.' });
-    }
-
-    const found = await db.select().from(users).where(eq(users.email, email)).limit(1);
-    if (found.length > 0 && found[0].active) {
-      const user = found[0];
-      const rawToken = generateResetToken();
-      const tokenHash = hashResetToken(rawToken);
-      const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
-
-      await db
-        .update(passwordResetTokens)
-        .set({ usedAt: new Date() })
-        .where(and(eq(passwordResetTokens.userId, user.id), isNull(passwordResetTokens.usedAt)));
-
-      await db.insert(passwordResetTokens).values({
-        userId: user.id,
-        email: user.email,
-        tokenHash,
-        expiresAt,
-      });
-
-      const baseUrl = getBaseAppUrl(req);
-      const resetLink = `${baseUrl}/?redefinir=${encodeURIComponent(rawToken)}`;
-      const subject = 'Recuperação de senha — QuadraMestre';
-      const bodyText = `Olá, ${user.name}!\n\nRecebemos uma solicitação para redefinir sua senha de acesso ao QuadraMestre.\n\nAcesse o link abaixo para escolher uma nova senha (válido por 1 hora):\n${resetLink}\n\nSe você não solicitou esta alteração, pode ignorar este e-mail com segurança.`;
-
-      const deliveryStatus = await sendTransactionalEmail({
-        toEmail: user.email,
-        subject,
-        bodyText,
-      });
-
-      await db.insert(passwordResetEmails).values({
-        userId: user.id,
-        toEmail: user.email,
-        subject,
-        bodyText,
-        resetLink,
-        status: deliveryStatus,
-      });
-    }
-
-    res.json({
-      ok: true,
-      message:
-        'Se existir uma conta cadastrada com este e-mail, enviaremos um link para redefinir sua senha.',
-    });
-  } catch (error) {
-    console.error('Erro ao solicitar recuperação de senha:', error);
-    res.status(500).json({ error: 'Não foi possível processar a solicitação de recuperação.' });
-  }
-});
-
-apiRouter.get('/auth/reset-password', async (req, res) => {
-  try {
-    const rawToken = String(req.query?.token ?? '').trim();
-    if (!rawToken) {
-      return res.status(400).json({ error: 'Token de recuperação ausente.' });
-    }
-
-    const tokenHash = hashResetToken(rawToken);
-    const rows = await db
-      .select()
-      .from(passwordResetTokens)
-      .where(eq(passwordResetTokens.tokenHash, tokenHash))
-      .limit(1);
-
-    if (rows.length === 0) {
-      return res.status(404).json({ error: 'Link de recuperação inválido.' });
-    }
-
-    const record = rows[0];
-    if (record.usedAt) {
-      return res.status(410).json({
-        error: 'Este link de recuperação já foi utilizado. Solicite um novo na tela de login.',
-      });
-    }
-    if (record.expiresAt.getTime() < Date.now()) {
-      return res.status(410).json({
-        error: 'Este link de recuperação expirou. Solicite um novo na tela de login.',
-      });
-    }
-
-    const userRows = await db.select().from(users).where(eq(users.id, record.userId)).limit(1);
-    if (userRows.length === 0 || !userRows[0].active) {
-      return res.status(404).json({ error: 'Conta de usuário não encontrada ou inativa.' });
-    }
-
-    res.json({
-      email: userRows[0].email,
-      name: userRows[0].name,
-    });
-  } catch (error) {
-    console.error('Erro ao validar token de recuperação:', error);
-    res.status(500).json({ error: 'Falha ao validar link de recuperação.' });
-  }
-});
-
-apiRouter.post('/auth/reset-password', async (req, res) => {
-  try {
-    const rawToken = String(req.body?.token ?? '').trim();
-    const newPassword = String(req.body?.password ?? '');
-
-    if (!rawToken) {
-      return res.status(400).json({ error: 'Token de recuperação obrigatório.' });
-    }
-    if (newPassword.length < 6) {
-      return res.status(400).json({ error: 'A nova senha deve ter pelo menos 6 caracteres.' });
-    }
-
-    const tokenHash = hashResetToken(rawToken);
-    const rows = await db
-      .select()
-      .from(passwordResetTokens)
-      .where(eq(passwordResetTokens.tokenHash, tokenHash))
-      .limit(1);
-
-    if (rows.length === 0) {
-      return res.status(404).json({ error: 'Link de recuperação inválido.' });
-    }
-
-    const record = rows[0];
-    if (record.usedAt) {
-      return res.status(410).json({ error: 'Este link de recuperação já foi utilizado.' });
-    }
-    if (record.expiresAt.getTime() < Date.now()) {
-      return res.status(410).json({ error: 'Este link de recuperação expirou.' });
-    }
-
-    const userRows = await db.select().from(users).where(eq(users.id, record.userId)).limit(1);
-    if (userRows.length === 0 || !userRows[0].active) {
-      return res.status(404).json({ error: 'Conta não encontrada ou inativa.' });
-    }
-    const user = userRows[0];
-
-    const passwordHash = await hashPassword(newPassword);
-    await db
-      .update(users)
-      .set({
-        passwordHash,
-        mustChangePassword: false,
-        active: true,
-      })
-      .where(eq(users.id, user.id));
-
-    await db
-      .update(passwordResetTokens)
-      .set({ usedAt: new Date() })
-      .where(and(eq(passwordResetTokens.userId, user.id), isNull(passwordResetTokens.usedAt)));
-
-    const linkedPlayers = await db
-      .select()
-      .from(players)
-      .where(eq(players.userId, user.id))
-      .limit(1);
-
-    const role = user.role === 'admin' ? 'admin' : 'player';
-    const sessionToken = signSessionToken({
-      userId: user.id,
-      uid: user.uid,
-      email: user.email,
-      role,
-    });
-
-    res.json({
-      token: sessionToken,
-      user: {
-        id: user.id,
-        uid: user.uid,
-        email: user.email,
-        name: user.name,
-        role,
-        playerId: linkedPlayers[0]?.id ?? null,
-      },
-      player: linkedPlayers[0] ?? null,
-    });
-  } catch (error) {
-    console.error('Erro ao redefinir senha:', error);
-    res.status(500).json({ error: 'Falha ao atualizar sua senha.' });
-  }
-});
-
-apiRouter.get('/auth/invite', async (req, res) => {
-  try {
-    const token = String(req.query?.token ?? '').trim();
-    if (!token) {
-      return res.status(400).json({ error: 'Token de convite ausente.' });
-    }
-
-    const found = await db
-      .select()
-      .from(users)
-      .where(eq(users.inviteToken, token))
-      .limit(1);
-
-    if (found.length === 0) {
-      return res.status(404).json({ error: 'Convite inválido ou já utilizado.' });
-    }
-
-    const u = found[0];
-    if (u.inviteExpiresAt && u.inviteExpiresAt.getTime() < Date.now()) {
-      return res.status(410).json({ error: 'Este convite expirou. Solicite um novo ao administrador.' });
-    }
-
-    const linkedPlayers = await db
-      .select()
-      .from(players)
-      .where(eq(players.userId, u.id))
-      .limit(1);
-
-    res.json({
-      email: u.email,
-      name: u.name,
-      player: linkedPlayers[0] ?? null,
-    });
-  } catch (error) {
-    console.error('Erro ao validar convite:', error);
-    res.status(500).json({ error: 'Falha ao validar convite.' });
-  }
-});
-
-apiRouter.post('/auth/complete-registration', async (req, res) => {
-  try {
-    const token = String(req.body?.token ?? '').trim();
-    const password = String(req.body?.password ?? '');
-    const name = String(req.body?.name ?? '').trim();
-    const nickname = String(req.body?.nickname ?? '').trim();
-    const age = req.body?.age ? Number(req.body.age) : null;
-    const position = VALID_POSITIONS.has(req.body?.position) ? req.body.position : 'Ala Direito';
-    const dominantFoot = VALID_FEET.has(req.body?.dominantFoot) ? req.body.dominantFoot : 'Destro';
-    const phone = String(req.body?.phone ?? '').trim() || null;
-    const photoUrl = sanitizeImageUrl(req.body?.photoUrl);
-
-    if (!token) {
-      return res.status(400).json({ error: 'Token de convite obrigatório.' });
-    }
-    if (password.length < 6) {
-      return res.status(400).json({ error: 'Defina uma senha com pelo menos 6 caracteres.' });
-    }
-    if (!name || !nickname) {
-      return res.status(400).json({ error: 'Nome completo e apelido são obrigatórios.' });
-    }
-
-    const found = await db.select().from(users).where(eq(users.inviteToken, token)).limit(1);
-    if (found.length === 0) {
-      return res.status(404).json({ error: 'Convite inválido ou já utilizado.' });
-    }
-
-    const u = found[0];
-    if (u.inviteExpiresAt && u.inviteExpiresAt.getTime() < Date.now()) {
-      return res.status(410).json({ error: 'Convite expirado.' });
-    }
-
-    const passwordHash = await hashPassword(password);
-    await db
-      .update(users)
-      .set({
-        name,
-        passwordHash,
-        inviteToken: null,
-        inviteExpiresAt: null,
-        mustChangePassword: false,
-        active: true,
-      })
-      .where(eq(users.id, u.id));
-
-    const existingPlayer = await db
-      .select()
-      .from(players)
-      .where(eq(players.userId, u.id))
-      .limit(1);
-
-    let savedPlayer: typeof players.$inferSelect;
-    let isBrandNewPlayer = false;
-    if (existingPlayer.length > 0) {
-      const updated = await db
-        .update(players)
-        .set({
-          name,
-          nickname,
-          age: age && Number.isFinite(age) ? Math.max(12, Math.min(80, Math.round(age))) : null,
-          position,
-          dominantFoot,
-          phone,
-          email: u.email,
-          photoUrl: photoUrl ?? existingPlayer[0].photoUrl,
-          profileCompleted: true,
-        })
-        .where(eq(players.id, existingPlayer[0].id))
-        .returning();
-      savedPlayer = updated[0];
-    } else {
-      isBrandNewPlayer = true;
-      const inserted = await db
-        .insert(players)
-        .values({
-          userId: u.id,
-          name,
-          nickname,
-          age: age && Number.isFinite(age) ? Math.max(12, Math.min(80, Math.round(age))) : null,
-          position,
-          dominantFoot,
-          phone,
-          email: u.email,
-          photoUrl,
-          initRatingStatus: 'pending_votes',
-          initVotesCount: 0,
-          profileCompleted: true,
-        })
-        .returning();
-      savedPlayer = inserted[0];
-    }
-
-    await syncUserPlayerGroupLinks(u.id, savedPlayer.id);
-
-    if (isBrandNewPlayer) {
-      const mGroups = await db
-        .select({ groupId: peladaGroupMembers.groupId })
-        .from(peladaGroupMembers)
-        .where(or(eq(peladaGroupMembers.userId, u.id), eq(peladaGroupMembers.playerId, savedPlayer.id)));
-      const targetGroupId = mGroups[0]?.groupId ?? null;
-      await notifyPeladaAdminsForNewPlayer({
-        playerId: savedPlayer.id,
-        playerNickname: savedPlayer.nickname,
-        playerName: savedPlayer.name,
-        groupId: targetGroupId,
-        creatorUserId: u.id,
-        creatorVoted: false,
-      });
-    }
-
-    const role = u.role === 'admin' ? 'admin' : 'player';
-    const sessionToken = signSessionToken({
-      userId: u.id,
-      uid: u.uid,
-      email: u.email,
-      role,
-    });
-
-    res.json({
-      token: sessionToken,
-      user: {
-        id: u.id,
-        uid: u.uid,
-        email: u.email,
-        name,
-        role,
-        playerId: savedPlayer.id,
-      },
-      player: savedPlayer,
-    });
-  } catch (error) {
-    console.error('Erro ao completar registro do jogador:', error);
-    res.status(500).json({ error: 'Falha ao concluir registro do peladeiro.' });
   }
 });
 
@@ -1450,7 +1069,7 @@ apiRouter.post('/auth/register-profile', requireAuth, async (req: AuthRequest, r
 });
 
 // ==========================================
-// ADMIN USER & INVITE MANAGEMENT
+// ADMIN USER MANAGEMENT
 // ==========================================
 
 apiRouter.get('/admin/users', requireAuth, requireAdmin, async (_req, res) => {
@@ -1464,7 +1083,6 @@ apiRouter.get('/admin/users', requireAuth, requireAdmin, async (_req, res) => {
         role: users.role,
         active: users.active,
         hasPassword: sql<boolean>`${users.passwordHash} IS NOT NULL`,
-        hasPendingInvite: sql<boolean>`${users.inviteToken} IS NOT NULL`,
         createdAt: users.createdAt,
       })
       .from(users)
@@ -1491,59 +1109,28 @@ apiRouter.get('/admin/users', requireAuth, requireAdmin, async (_req, res) => {
   }
 });
 
-apiRouter.get('/admin/invites', requireAuth, requireAdmin, async (_req, res) => {
-  try {
-    const list = await db
-      .select()
-      .from(inviteEmails)
-      .orderBy(desc(inviteEmails.createdAt))
-      .limit(50);
-    res.json(list);
-  } catch (error) {
-    console.error('Erro ao listar e-mails de convite:', error);
-    res.status(500).json({ error: 'Falha ao carregar caixa de convites enviados.' });
-  }
-});
-
-apiRouter.get('/admin/password-resets', requireAuth, requireAdmin, async (_req, res) => {
-  try {
-    const list = await db
-      .select()
-      .from(passwordResetEmails)
-      .orderBy(desc(passwordResetEmails.createdAt))
-      .limit(50);
-    res.json(list);
-  } catch (error) {
-    console.error('Erro ao listar solicitações de recuperação de senha:', error);
-    res.status(500).json({ error: 'Falha ao carregar e-mails de recuperação de senha.' });
-  }
-});
-
 apiRouter.post('/admin/users', requireAuth, requireAdmin, async (req: AuthRequest, res) => {
   try {
     const email = String(req.body?.email ?? '').trim().toLowerCase();
     const name = String(req.body?.name ?? '').trim();
     const role = req.body?.role === 'admin' ? 'admin' : 'player';
-    const password = req.body?.password ? String(req.body.password) : '';
-    const sendInvite = Boolean(req.body?.sendInvite);
+    const password = String(req.body?.password ?? '');
     const playerId = req.body?.playerId ? Number(req.body.playerId) : null;
 
-    if (!email || !email.includes('@')) {
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 180) {
       return res.status(400).json({ error: 'Informe um e-mail válido.' });
     }
     if (!name) {
       return res.status(400).json({ error: 'Informe o nome do usuário.' });
     }
-    if (!sendInvite && password.length < 6) {
+    if (password.length < 6) {
       return res.status(400).json({
-        error: 'Informe uma senha com no mínimo 6 caracteres ou marque para enviar convite por e-mail.',
+        error: 'Informe uma senha com no mínimo 6 dígitos.',
       });
     }
 
     const existing = await db.select().from(users).where(eq(users.email, email)).limit(1);
-    const passwordHash = password.length >= 6 ? await hashPassword(password) : null;
-    const inviteToken = sendInvite ? generateInviteToken() : null;
-    const inviteExpiresAt = sendInvite ? new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) : null;
+    const passwordHash = await hashPassword(password);
 
     let savedUser: typeof users.$inferSelect;
     if (existing.length > 0) {
@@ -1552,9 +1139,10 @@ apiRouter.post('/admin/users', requireAuth, requireAdmin, async (req: AuthReques
         .set({
           name,
           role,
-          passwordHash: passwordHash ?? existing[0].passwordHash,
-          inviteToken: inviteToken ?? existing[0].inviteToken,
-          inviteExpiresAt: inviteExpiresAt ?? existing[0].inviteExpiresAt,
+          passwordHash,
+          inviteToken: null,
+          inviteExpiresAt: null,
+          mustChangePassword: false,
           active: true,
         })
         .where(eq(users.id, existing[0].id))
@@ -1569,8 +1157,6 @@ apiRouter.post('/admin/users', requireAuth, requireAdmin, async (req: AuthReques
           name,
           role,
           passwordHash,
-          inviteToken,
-          inviteExpiresAt,
           active: true,
         })
         .returning();
@@ -1595,27 +1181,6 @@ apiRouter.post('/admin/users', requireAuth, requireAdmin, async (req: AuthReques
       });
     }
 
-    let inviteRecord = null;
-    if (inviteToken) {
-      const baseUrl = getBaseAppUrl(req);
-      const inviteLink = `${baseUrl}/?convite=${encodeURIComponent(inviteToken)}`;
-      const subject = 'Convite QuadraMestre — Cadastre seu login e senha da pelada';
-      const bodyText = `Olá ${name},\n\nVocê foi cadastrado(a) no QuadraMestre! Acesse o link abaixo para registrar sua senha, completar sua ficha de peladeiro (foto, idade, apelido, posição e pé dominante) e acompanhar suas estatísticas:\n\n${inviteLink}\n\nEste convite é válido por 7 dias.`;
-      const insertedInvite = await db
-        .insert(inviteEmails)
-        .values({
-          userId: savedUser.id,
-          playerId,
-          toEmail: email,
-          subject,
-          bodyText,
-          inviteLink,
-          status: 'sent',
-        })
-        .returning();
-      inviteRecord = insertedInvite[0];
-    }
-
     res.status(201).json({
       user: {
         id: savedUser.id,
@@ -1623,80 +1188,10 @@ apiRouter.post('/admin/users', requireAuth, requireAdmin, async (req: AuthReques
         name: savedUser.name,
         role: savedUser.role,
       },
-      invite: inviteRecord,
     });
   } catch (error) {
     console.error('Erro ao criar acesso de usuário:', error);
     res.status(500).json({ error: 'Falha ao criar conta de acesso.' });
-  }
-});
-
-apiRouter.post('/admin/players/:id/invite', requireAuth, requireAdmin, async (req: AuthRequest, res) => {
-  try {
-    const playerId = Number(req.params.id);
-    if (!Number.isInteger(playerId)) return res.status(400).json({ error: 'ID inválido.' });
-
-    const playerRows = await db.select().from(players).where(eq(players.id, playerId)).limit(1);
-    if (playerRows.length === 0) return res.status(404).json({ error: 'Jogador não encontrado.' });
-    const p = playerRows[0];
-
-    const email = String(req.body?.email ?? p.email ?? '').trim().toLowerCase();
-    if (!email || !email.includes('@')) {
-      return res.status(400).json({ error: 'Informe um e-mail válido para enviar o convite.' });
-    }
-
-    const inviteToken = generateInviteToken();
-    const inviteExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-
-    const existingUser = await db.select().from(users).where(eq(users.email, email)).limit(1);
-    let userId: number;
-    if (existingUser.length > 0) {
-      const updated = await db
-        .update(users)
-        .set({ inviteToken, inviteExpiresAt, active: true })
-        .where(eq(users.id, existingUser[0].id))
-        .returning();
-      userId = updated[0].id;
-    } else {
-      const inserted = await db
-        .insert(users)
-        .values({
-          uid: `local:${crypto.randomUUID()}`,
-          email,
-          name: p.name,
-          role: 'player',
-          inviteToken,
-          inviteExpiresAt,
-          active: true,
-        })
-        .returning();
-      userId = inserted[0].id;
-    }
-
-    await db.update(players).set({ userId, email }).where(eq(players.id, p.id));
-
-    const baseUrl = getBaseAppUrl(req);
-    const inviteLink = `${baseUrl}/?convite=${encodeURIComponent(inviteToken)}`;
-    const subject = 'Convite QuadraMestre — Cadastre seu login e senha da pelada';
-    const bodyText = `Fala ${p.nickname} (${p.name})!\n\nVocê recebeu um convite para acessar o QuadraMestre. Clique no link abaixo para cadastrar seu login e senha e completar sua ficha de peladeiro:\n\n${inviteLink}\n\nVálido por 7 dias.`;
-
-    const inv = await db
-      .insert(inviteEmails)
-      .values({
-        userId,
-        playerId: p.id,
-        toEmail: email,
-        subject,
-        bodyText,
-        inviteLink,
-        status: 'sent',
-      })
-      .returning();
-
-    res.status(201).json({ invite: inv[0] });
-  } catch (error) {
-    console.error('Erro ao enviar convite ao jogador:', error);
-    res.status(500).json({ error: 'Falha ao gerar convite por e-mail.' });
   }
 });
 
@@ -1903,39 +1398,34 @@ apiRouter.post('/players', requireAuth, async (req: AuthRequest, res) => {
     const initialStatus =
       castInitialVote && peladaAdminIds.length <= 1 ? 'approved' : 'pending_votes';
 
-    const accessMode = isAdmin ? String(req.body?.accessMode ?? 'none') : 'none'; // 'none' | 'invite' | 'password'
+    const accessMode = isAdmin && req.body?.accessMode === 'password' ? 'password' : 'none';
     const initialPassword = String(req.body?.initialPassword ?? '');
 
     let linkedUserId: number | null = null;
-    let inviteToken: string | null = null;
 
-    if (accessMode !== 'none') {
-      if (!email || !email.includes('@')) {
+    if (accessMode === 'password') {
+      if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
         return res.status(400).json({
-          error: 'Para gerar login ou enviar convite por e-mail, informe um e-mail válido.',
+          error: 'Para criar login e senha do jogador, informe um e-mail válido.',
         });
       }
-      if (accessMode === 'password' && initialPassword.length < 6) {
+      if (initialPassword.length < 6) {
         return res.status(400).json({
-          error: 'A senha inicial do jogador deve ter pelo menos 6 caracteres.',
+          error: 'A senha inicial do jogador deve ter pelo menos 6 dígitos.',
         });
       }
 
       const existingUser = await db.select().from(users).where(eq(users.email, email)).limit(1);
-      const passwordHash =
-        accessMode === 'password' ? await hashPassword(initialPassword) : null;
-      inviteToken = accessMode === 'invite' ? generateInviteToken() : null;
-      const inviteExpiresAt =
-        accessMode === 'invite' ? new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) : null;
+      const passwordHash = await hashPassword(initialPassword);
 
       if (existingUser.length > 0) {
         const updatedUser = await db
           .update(users)
           .set({
             name,
-            passwordHash: passwordHash ?? existingUser[0].passwordHash,
-            inviteToken: inviteToken ?? existingUser[0].inviteToken,
-            inviteExpiresAt: inviteExpiresAt ?? existingUser[0].inviteExpiresAt,
+            passwordHash,
+            inviteToken: null,
+            inviteExpiresAt: null,
             active: true,
           })
           .where(eq(users.id, existingUser[0].id))
@@ -1950,8 +1440,6 @@ apiRouter.post('/players', requireAuth, async (req: AuthRequest, res) => {
             name,
             role: 'player',
             passwordHash,
-            inviteToken,
-            inviteExpiresAt,
             active: true,
           })
           .returning();
@@ -2044,34 +1532,12 @@ apiRouter.post('/players', requireAuth, async (req: AuthRequest, res) => {
       creatorVoted: castInitialVote,
     });
 
-    let inviteRecord = null;
-    if (linkedUserId && inviteToken && email) {
-      const baseUrl = getBaseAppUrl(req);
-      const inviteLink = `${baseUrl}/?convite=${encodeURIComponent(inviteToken)}`;
-      const subject = 'Convite QuadraMestre — Cadastre sua senha na pelada';
-      const bodyText = `Fala ${nickname} (${name})!\n\nVocê foi cadastrado(a) na pelada pelo administrador. Acesse o link abaixo para definir seu login e senha e completar seu perfil com foto e dados:\n\n${inviteLink}\n\nNos vemos na quadra!`;
-      const inv = await db
-        .insert(inviteEmails)
-        .values({
-          userId: linkedUserId,
-          playerId: createdPlayer.id,
-          toEmail: email,
-          subject,
-          bodyText,
-          inviteLink,
-          status: 'sent',
-        })
-        .returning();
-      inviteRecord = inv[0];
-    }
-
     res.status(201).json({
       player: {
         ...createdPlayer,
         initScores: scoresMap,
         curScores: scoresMap,
       },
-      invite: inviteRecord,
     });
   } catch (error) {
     console.error('Erro ao cadastrar jogador:', error);
@@ -2679,13 +2145,6 @@ function parseNonNegativeFee(raw: unknown, fallback = 0): number {
   return Math.min(10000, Math.round(num * 100) / 100);
 }
 
-function formatBrl(value: number): string {
-  return new Intl.NumberFormat('pt-BR', {
-    style: 'currency',
-    currency: 'BRL',
-  }).format(value);
-}
-
 apiRouter.post('/groups', requireAuth, requireAdmin, async (req: AuthRequest, res) => {
   try {
     const authUser = req.authUser!;
@@ -2840,168 +2299,6 @@ apiRouter.put('/groups/:id', requireAuth, async (req: AuthRequest, res) => {
   } catch (error) {
     console.error('Erro ao atualizar pelada fixa:', error);
     res.status(500).json({ error: 'Falha ao atualizar pelada fixa.' });
-  }
-});
-
-apiRouter.get('/groups/:id/invites', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const groupId = Number(req.params.id);
-    if (!Number.isInteger(groupId) || groupId <= 0) {
-      return res.status(400).json({ error: 'ID inválido.' });
-    }
-    const allowed =
-      (await isUserAdminOfGroup(req.authUser!, groupId)) ||
-      (await hasActiveGroupAccess(req.authUser!, groupId));
-    if (!allowed) {
-      return res.status(403).json({ error: 'Apenas participantes cadastrados nesta pelada podem visualizar os convites.' });
-    }
-
-    const rows = await db
-      .select()
-      .from(inviteEmails)
-      .where(eq(inviteEmails.groupId, groupId))
-      .orderBy(desc(inviteEmails.createdAt))
-      .limit(25);
-    res.json(rows);
-  } catch (error) {
-    console.error('Erro ao listar convites da pelada:', error);
-    res.status(500).json({ error: 'Falha ao carregar convites enviados.' });
-  }
-});
-
-apiRouter.post('/groups/:id/invite-player', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const groupId = Number(req.params.id);
-    if (!Number.isInteger(groupId) || groupId <= 0) {
-      return res.status(400).json({ error: 'ID da pelada inválido.' });
-    }
-
-    const authUser = req.authUser!;
-    const allowed =
-      (await isUserAdminOfGroup(authUser, groupId)) ||
-      (await hasActiveGroupAccess(authUser, groupId));
-    if (!allowed) {
-      return res.status(403).json({
-        error: 'Apenas administradores ou peladeiros já cadastrados nesta pelada podem enviar convites.',
-      });
-    }
-
-    const groupRows = await db
-      .select()
-      .from(peladaGroups)
-      .where(eq(peladaGroups.id, groupId))
-      .limit(1);
-    if (groupRows.length === 0) {
-      return res.status(404).json({ error: 'Pelada fixa não encontrada.' });
-    }
-    const group = groupRows[0];
-
-    const email = String(req.body?.email ?? '').trim().toLowerCase();
-    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 180) {
-      return res.status(400).json({ error: 'Informe um e-mail válido para convidar o peladeiro.' });
-    }
-
-    const rawFee = req.body?.avulsoFee;
-    if (rawFee !== undefined && rawFee !== null && String(rawFee).trim() !== '') {
-      const normalized = typeof rawFee === 'string' ? rawFee.replace(',', '.').trim() : rawFee;
-      const num = Number(normalized);
-      if (!Number.isFinite(num) || num < 0 || num > 10000) {
-        return res.status(400).json({ error: 'Informe um valor de avulso válido (R$ 0,00 ou maior).' });
-      }
-    }
-    const avulsoFee = parseNonNegativeFee(rawFee, group.avulsoFee ?? 0);
-
-    const existingUserRows = await db.select().from(users).where(eq(users.email, email)).limit(1);
-    const baseUrl = getBaseAppUrl(req);
-    let targetUserId: number;
-    let inviteLink = baseUrl;
-
-    if (existingUserRows.length > 0) {
-      const existingUser = existingUserRows[0];
-      targetUserId = existingUser.id;
-      if (!existingUser.passwordHash) {
-        const inviteToken = generateInviteToken();
-        const inviteExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-        await db
-          .update(users)
-          .set({ inviteToken, inviteExpiresAt, active: true })
-          .where(eq(users.id, existingUser.id));
-        inviteLink = `${baseUrl}/?convite=${encodeURIComponent(inviteToken)}`;
-      }
-    } else {
-      const inviteToken = generateInviteToken();
-      const inviteExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-      const fallbackName = email.split('@')[0].slice(0, 60) || 'Convidado';
-      const insertedUser = await db
-        .insert(users)
-        .values({
-          uid: `local:${crypto.randomUUID()}`,
-          email,
-          name: fallbackName,
-          role: 'player',
-          inviteToken,
-          inviteExpiresAt,
-          active: true,
-        })
-        .returning();
-      targetUserId = insertedUser[0].id;
-      inviteLink = `${baseUrl}/?convite=${encodeURIComponent(inviteToken)}`;
-    }
-
-    const linkedPlayerRows = await db
-      .select({ id: players.id })
-      .from(players)
-      .where(eq(players.userId, targetUserId))
-      .limit(1);
-    const linkedPlayerId = linkedPlayerRows[0]?.id ?? null;
-
-    const fullAddressText = group.fullAddress?.trim()
-      ? `${group.location} — ${group.fullAddress.trim()}`
-      : group.location;
-    const feeFormatted = avulsoFee > 0 ? formatBrl(avulsoFee) : 'Gratuito (R$ 0,00)';
-
-    const subject = `Convite para a Pelada: ${group.name} (${group.weekday} às ${group.startTime})`;
-    const bodyText = [
-      `Olá!`,
-      ``,
-      `${authUser.name} convidou você para participar da pelada "${group.name}" no QuadraMestre!`,
-      ``,
-      `Detalhes da Pelada:`,
-      `- Nome da pelada: ${group.name}`,
-      `- Dia: ${group.weekday}`,
-      `- Horário: ${group.startTime}`,
-      `- Endereço completo: ${fullAddressText}`,
-      `- Valor do avulso: ${feeFormatted}`,
-      ``,
-      `Para confirmar sua presença ou concluir seu cadastro, acesse:`,
-      `${inviteLink}`,
-      ``,
-      `Nos vemos na quadra!`,
-    ].join('\n');
-
-    const insertedInvite = await db
-      .insert(inviteEmails)
-      .values({
-        userId: targetUserId,
-        playerId: linkedPlayerId,
-        groupId: group.id,
-        invitedByUserId: authUser.id,
-        avulsoFee,
-        toEmail: email,
-        subject,
-        bodyText,
-        inviteLink,
-        status: 'sent',
-      })
-      .returning();
-
-    res.status(201).json({
-      invite: insertedInvite[0],
-      avulsoFee,
-    });
-  } catch (error) {
-    console.error('Erro ao gerar convite de peladeiro:', error);
-    res.status(500).json({ error: 'Falha ao criar e-mail de convite da pelada.' });
   }
 });
 
@@ -4340,19 +3637,18 @@ apiRouter.patch('/peladas/:id/status', requireAuth, async (req: AuthRequest, res
       .where(eq(peladas.id, id))
       .returning();
 
-    let financeResult = null;
+    let financeSummary = null;
     if (status === 'finished' && pelada.groupId) {
-      financeResult = await ensurePeladaChargesAndSendPixEmails({
+      financeSummary = await ensurePeladaCharges({
         groupId: pelada.groupId,
         peladaId: id,
         createMissingForPelada: true,
-        sendEmails: true,
       });
     }
 
     res.json({
       ...updated[0],
-      financeNotification: financeResult,
+      financeSummary,
     });
   } catch (error) {
     console.error('Erro ao atualizar status da pelada:', error);
@@ -4987,7 +4283,7 @@ apiRouter.post('/matches/:id/evaluations', requireAuth, async (req: AuthRequest,
 });
 
 // ==========================================
-// CONTROLE FINANCEIRO DA PELADA & COBRANÇA PIX
+// CONTROLE FINANCEIRO DA PELADA
 // ==========================================
 
 const VALID_FINANCE_ENTRY_TYPES = new Set(['cash_box', 'income', 'expense', 'pending_debt']);
@@ -4999,13 +4295,12 @@ function formatMonthYearRef(dateStr: string): string {
   return `${String(now.getUTCMonth() + 1).padStart(2, '0')}/${now.getUTCFullYear()}`;
 }
 
-async function ensurePeladaChargesAndSendPixEmails(params: {
+async function ensurePeladaCharges(params: {
   groupId: number;
   peladaId?: number | null;
   createMissingForPelada?: boolean;
-  sendEmails?: boolean;
 }) {
-  const { groupId, peladaId = null, createMissingForPelada = false, sendEmails = true } = params;
+  const { groupId, peladaId = null, createMissingForPelada = false } = params;
 
   const groupRows = await db
     .select()
@@ -5013,13 +4308,7 @@ async function ensurePeladaChargesAndSendPixEmails(params: {
     .where(eq(peladaGroups.id, groupId))
     .limit(1);
   if (groupRows.length === 0) {
-    return {
-      chargesCreated: 0,
-      emailsSent: 0,
-      skippedNoPix: false,
-      skippedNoEmail: [] as string[],
-      emails: [] as Array<typeof peladaPixPaymentEmails.$inferSelect>,
-    };
+    return { chargesCreated: 0 };
   }
   const group = groupRows[0];
 
@@ -5034,16 +4323,15 @@ async function ensurePeladaChargesAndSendPixEmails(params: {
   }
 
   let chargesCreated = 0;
-  let presentPlayerIds: number[] | null = null;
 
-  if (targetPelada) {
+  if (targetPelada && createMissingForPelada) {
     const attRows = await db
       .select({ playerId: peladaAttendances.playerId })
       .from(peladaAttendances)
       .where(and(eq(peladaAttendances.peladaId, targetPelada.id), eq(peladaAttendances.present, true)));
-    presentPlayerIds = attRows.map((a) => a.playerId);
+    const presentPlayerIds = attRows.map((a) => a.playerId);
 
-    if (createMissingForPelada && presentPlayerIds.length > 0) {
+    if (presentPlayerIds.length > 0) {
       const memberRows = await db
         .select()
         .from(peladaGroupMembers)
@@ -5114,151 +4402,7 @@ async function ensurePeladaChargesAndSendPixEmails(params: {
     }
   }
 
-  const pixKey = group.pixKey?.trim() ?? '';
-  if (!sendEmails) {
-    return {
-      chargesCreated,
-      emailsSent: 0,
-      skippedNoPix: !pixKey,
-      skippedNoEmail: [],
-      emails: [],
-    };
-  }
-
-  if (!pixKey) {
-    return {
-      chargesCreated,
-      emailsSent: 0,
-      skippedNoPix: true,
-      skippedNoEmail: [],
-      emails: [],
-    };
-  }
-
-  const pendingPayments = await db
-    .select()
-    .from(peladaParticipantPayments)
-    .where(
-      and(
-        eq(peladaParticipantPayments.groupId, groupId),
-        eq(peladaParticipantPayments.status, 'pending')
-      )
-    );
-
-  // If finishing a specific pelada with present players, prioritize those pending payments
-  // (either matching this peladaId or unpaid mensalidades of present players)
-  const scopedPending = pendingPayments.filter((pay) => {
-    if (pay.amount <= 0) return false;
-    if (targetPelada) {
-      if (pay.peladaId === targetPelada.id) return true;
-      if (presentPlayerIds && presentPlayerIds.includes(pay.playerId)) return true;
-      return false;
-    }
-    return true;
-  });
-
-  if (scopedPending.length === 0) {
-    return {
-      chargesCreated,
-      emailsSent: 0,
-      skippedNoPix: false,
-      skippedNoEmail: [],
-      emails: [],
-    };
-  }
-
-  const pIds = Array.from(new Set(scopedPending.map((p) => p.playerId)));
-  const pRows = await db.select().from(players).where(inArray(players.id, pIds));
-  const playerMap = new Map(pRows.map((p) => [p.id, p]));
-
-  const uIds = Array.from(
-    new Set(
-      [...scopedPending.map((p) => p.userId), ...pRows.map((p) => p.userId)].filter(
-        (id): id is number => id != null
-      )
-    )
-  );
-  const uRows =
-    uIds.length > 0
-      ? await db
-          .select({ id: users.id, email: users.email })
-          .from(users)
-          .where(inArray(users.id, uIds))
-      : [];
-  const userEmailMap = new Map(uRows.map((u) => [u.id, u.email]));
-
-  const sentEmails: Array<typeof peladaPixPaymentEmails.$inferSelect> = [];
-  const skippedNoEmail: string[] = [];
-
-  for (const pay of scopedPending) {
-    const player = playerMap.get(pay.playerId);
-    if (!player) continue;
-    const toEmail =
-      player.email?.trim() ||
-      (pay.userId ? userEmailMap.get(pay.userId) : undefined) ||
-      (player.userId ? userEmailMap.get(player.userId) : undefined) ||
-      '';
-
-    if (!toEmail || !toEmail.includes('@')) {
-      skippedNoEmail.push(player.nickname || player.name);
-      continue;
-    }
-
-    const tipoLabel = pay.paymentType === 'mensalidade' ? 'Mensalidade' : 'Diária';
-    const valorFormatado = formatBrl(pay.amount);
-    const encontroInfo = targetPelada
-      ? `${targetPelada.title} (${targetPelada.eventDate})`
-      : pay.referenceLabel;
-
-    const subject = `Pagamento pendente (${tipoLabel}) — ${group.name} · ${valorFormatado}`;
-    const bodyText = [
-      `Olá ${player.nickname} (${player.name})!`,
-      ``,
-      `Identificamos um pagamento pendente referente à pelada "${group.name}".`,
-      ``,
-      `Detalhes da cobrança:`,
-      `- Tipo: ${tipoLabel}`,
-      `- Referência: ${encontroInfo}`,
-      `- Valor para pagamento: ${valorFormatado}`,
-      `- Chave PIX para pagamento: ${pixKey}`,
-      ``,
-      `Após realizar a transferência via PIX, o Presidente ou Tesoureiro da pelada confirmará o recebimento no controle financeiro do QuadraMestre.`,
-      ``,
-      `Obrigado e até o próximo jogo!`,
-    ].join('\n');
-
-    const inserted = await db
-      .insert(peladaPixPaymentEmails)
-      .values({
-        groupId,
-        peladaId: targetPelada?.id ?? pay.peladaId ?? null,
-        paymentId: pay.id,
-        userId: pay.userId ?? player.userId ?? null,
-        playerId: player.id,
-        toEmail,
-        subject,
-        bodyText,
-        pixKey,
-        amount: pay.amount,
-        status: 'sent',
-      })
-      .returning();
-
-    sentEmails.push(inserted[0]);
-
-    await db
-      .update(peladaParticipantPayments)
-      .set({ pixEmailSentAt: new Date() })
-      .where(eq(peladaParticipantPayments.id, pay.id));
-  }
-
-  return {
-    chargesCreated,
-    emailsSent: sentEmails.length,
-    skippedNoPix: false,
-    skippedNoEmail,
-    emails: sentEmails,
-  };
+  return { chargesCreated };
 }
 
 apiRouter.get('/groups/:id/finance', requireAuth, async (req: AuthRequest, res) => {
@@ -5290,7 +4434,7 @@ apiRouter.get('/groups/:id/finance', requireAuth, async (req: AuthRequest, res) 
 
     const permissions = await getGroupFinancialPermission(authUser, groupId);
 
-    const [entryRows, paymentRows, pixEmailRows, groupPeladas, groupMemberRows] =
+    const [entryRows, paymentRows, groupPeladas, groupMemberRows] =
       await Promise.all([
         db
           .select()
@@ -5302,12 +4446,6 @@ apiRouter.get('/groups/:id/finance', requireAuth, async (req: AuthRequest, res) 
           .from(peladaParticipantPayments)
           .where(eq(peladaParticipantPayments.groupId, groupId))
           .orderBy(desc(peladaParticipantPayments.createdAt), desc(peladaParticipantPayments.id)),
-        db
-          .select()
-          .from(peladaPixPaymentEmails)
-          .where(eq(peladaPixPaymentEmails.groupId, groupId))
-          .orderBy(desc(peladaPixPaymentEmails.sentAt))
-          .limit(50),
         db
           .select({
             id: peladas.id,
@@ -5350,12 +4488,7 @@ apiRouter.get('/groups/:id/finance', requireAuth, async (req: AuthRequest, res) 
         : [];
     const userNameMap = new Map(userRows.map((u) => [u.id, u.name]));
 
-    const allPayPlayerIds = Array.from(
-      new Set([
-        ...paymentRows.map((p) => p.playerId),
-        ...pixEmailRows.map((e) => e.playerId),
-      ])
-    );
+    const allPayPlayerIds = Array.from(new Set(paymentRows.map((p) => p.playerId)));
     const payPlayers =
       allPayPlayerIds.length > 0
         ? await db.select().from(players).where(inArray(players.id, allPayPlayerIds))
@@ -5504,10 +4637,6 @@ apiRouter.get('/groups/:id/finance', requireAuth, async (req: AuthRequest, res) 
             : null,
         };
       }),
-      pixEmails: pixEmailRows.map((em) => ({
-        ...em,
-        playerNickname: payPlayerMap.get(em.playerId)?.nickname ?? null,
-      })),
       peladas: groupPeladas,
       participants,
     });
@@ -5771,11 +4900,10 @@ apiRouter.post('/groups/:id/finance/payments', requireAuth, async (req: AuthRequ
     const amount = round2(rawAmount);
 
     if (mode === 'pelada_present' && peladaId) {
-      const resSync = await ensurePeladaChargesAndSendPixEmails({
+      const resSync = await ensurePeladaCharges({
         groupId,
         peladaId,
         createMissingForPelada: true,
-        sendEmails: false,
       });
       return res.status(201).json({ createdCount: resSync.chargesCreated });
     }
@@ -5965,60 +5093,5 @@ apiRouter.delete(
   }
 );
 
-apiRouter.post('/groups/:id/finance/send-pix-emails', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const groupId = Number(req.params.id);
-    if (!Number.isInteger(groupId) || groupId <= 0) {
-      return res.status(400).json({ error: 'ID inválido.' });
-    }
-    const allowed = await isUserAdminOfGroup(req.authUser!, groupId);
-    if (!allowed) {
-      return res.status(403).json({
-        error: 'Apenas administradores da pelada podem enviar e-mails de cobrança PIX.',
-      });
-    }
 
-    const peladaId = req.body?.peladaId ? Number(req.body.peladaId) : null;
-    const createMissingForPelada = req.body?.createMissingForPelada === true;
-
-    const result = await ensurePeladaChargesAndSendPixEmails({
-      groupId,
-      peladaId,
-      createMissingForPelada,
-      sendEmails: true,
-    });
-
-    if (result.skippedNoPix) {
-      return res.status(400).json({
-        error: 'Configure a chave PIX da pelada antes de enviar os e-mails de cobrança.',
-      });
-    }
-
-    res.json(result);
-  } catch (error) {
-    console.error('Erro ao enviar e-mails PIX:', error);
-    res.status(500).json({ error: 'Falha ao gerar e-mails de cobrança PIX.' });
-  }
-});
-
-apiRouter.get('/my-pix-emails', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const authUser = req.authUser!;
-    const conds = [eq(peladaPixPaymentEmails.userId, authUser.id)];
-    if (authUser.playerId) conds.push(eq(peladaPixPaymentEmails.playerId, authUser.playerId));
-    if (authUser.email) conds.push(eq(peladaPixPaymentEmails.toEmail, authUser.email.toLowerCase()));
-
-    const rows = await db
-      .select()
-      .from(peladaPixPaymentEmails)
-      .where(or(...conds))
-      .orderBy(desc(peladaPixPaymentEmails.sentAt))
-      .limit(30);
-
-    res.json(rows);
-  } catch (error) {
-    console.error('Erro ao listar seus e-mails PIX:', error);
-    res.status(500).json({ error: 'Falha ao carregar e-mails de cobrança PIX.' });
-  }
-});
 

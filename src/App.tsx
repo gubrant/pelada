@@ -1,15 +1,12 @@
 import { useCallback, useEffect, useState } from 'react';
-import { onAuthStateChanged, signOut } from 'firebase/auth';
 import {
   ArrowLeft,
   BarChart3,
   Bell,
   CalendarDays,
-  Check,
   CheckCircle2,
   ChevronRight,
   Clock,
-  Copy,
   Edit3,
   KeyRound,
   LogOut,
@@ -17,7 +14,6 @@ import {
   MapPin,
   Plus,
   Search,
-  Send,
   Sliders,
   Trophy,
   UserCheck,
@@ -41,14 +37,12 @@ import { PlayerDetailModal } from './components/PlayerDetailModal';
 import { PlayerFormModal } from './components/PlayerFormModal';
 import { SeasonsAndStatsView } from './components/SeasonsAndStatsView';
 import { SummaryEmailsModal } from './components/SummaryEmailsModal';
-import { apiFetch, registerFirebaseTokenResolver, setInMemoryAuthToken } from './lib/api';
-import { auth } from './lib/firebase';
+import { apiFetch, setInMemoryAuthToken } from './lib/api';
 import {
   type AdminNotification,
   type AuthUser,
   DEFAULT_GROUP_CRITERIA,
   FUTSAL_POSITIONS,
-  type InviteEmailRecord,
   PLAYER_CATEGORIES,
   type PeladaGroupSummary,
   type PeladaSummary,
@@ -79,18 +73,8 @@ function formatCurrencyBrl(value?: number | null): string {
 }
 
 export default function App() {
-  const [authReady, setAuthReady] = useState(false);
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
   const [myPlayer, setMyPlayer] = useState<Player | null>(null);
-
-  const [inviteToken, setInviteToken] = useState<string | null>(() => {
-    const params = new URLSearchParams(window.location.search);
-    return params.get('convite');
-  });
-  const [resetToken, setResetToken] = useState<string | null>(() => {
-    const params = new URLSearchParams(window.location.search);
-    return params.get('redefinir');
-  });
 
   // Top-level fixed peladas (groups) vs selected group & screen inside it
   const [groups, setGroups] = useState<PeladaGroupSummary[]>([]);
@@ -122,18 +106,12 @@ export default function App() {
   );
   const [groupSelectedPlayerIds, setGroupSelectedPlayerIds] = useState<number[]>([]);
 
-  // Inline edit of Fixed Pelada info & Convida Peladeiro (Level 2 header)
+  // Inline edit of Fixed Pelada info (Level 2 header)
   const [editingGroupInfo, setEditingGroupInfo] = useState(false);
   const [editGroupLocation, setEditGroupLocation] = useState('');
   const [editGroupFullAddress, setEditGroupFullAddress] = useState('');
   const [editGroupAvulsoFee, setEditGroupAvulsoFee] = useState('0');
   const [savingGroupInfo, setSavingGroupInfo] = useState(false);
-
-  const [inviteGuestEmail, setInviteGuestEmail] = useState('');
-  const [inviteGuestAvulsoFee, setInviteGuestAvulsoFee] = useState('0');
-  const [sendingGroupInvite, setSendingGroupInvite] = useState(false);
-  const [generatedGroupInvite, setGeneratedGroupInvite] = useState<InviteEmailRecord | null>(null);
-  const [copiedGroupInvite, setCopiedGroupInvite] = useState(false);
 
   // New Encontro (Pelada session) form inside a Fixed Pelada
   const [showNewPeladaForm, setShowNewPeladaForm] = useState(false);
@@ -153,7 +131,6 @@ export default function App() {
   const [editingPlayer, setEditingPlayer] = useState<Player | null | 'new'>(null);
   const [detailPlayerId, setDetailPlayerId] = useState<number | null>(null);
   const [showMyProfile, setShowMyProfile] = useState(false);
-  const [latestInviteBanner, setLatestInviteBanner] = useState<InviteEmailRecord | null>(null);
 
   // Criteria configuration, admin notifications & initial rating voting
   const [notifications, setNotifications] = useState<AdminNotification[]>([]);
@@ -182,48 +159,7 @@ export default function App() {
   const [loadingData, setLoadingData] = useState(false);
   const [appError, setAppError] = useState<string | null>(null);
 
-  const clearInviteUrl = useCallback(() => {
-    setInviteToken(null);
-    const url = new URL(window.location.href);
-    url.searchParams.delete('convite');
-    window.history.replaceState({}, '', url.toString());
-  }, []);
 
-  const clearResetUrl = useCallback(() => {
-    setResetToken(null);
-    const url = new URL(window.location.href);
-    url.searchParams.delete('redefinir');
-    window.history.replaceState({}, '', url.toString());
-  }, []);
-
-  useEffect(() => {
-    registerFirebaseTokenResolver(async () => {
-      const current = auth.currentUser;
-      if (!current) return null;
-      return current.getIdToken();
-    });
-
-    const unsub = onAuthStateChanged(auth, async (fbUser) => {
-      if (fbUser && !inviteToken && !resetToken) {
-        try {
-          const token = await fbUser.getIdToken();
-          const me = await apiFetch<{ user: AuthUser; player: Player | null }>('/api/auth/me', {
-            headers: { Authorization: `Bearer ${token}` },
-          });
-          setAuthUser(me.user);
-          setMyPlayer(me.player);
-        } catch {
-          // Keep current state if local token is active
-        }
-      }
-      setAuthReady(true);
-    });
-
-    return () => {
-      unsub();
-      registerFirebaseTokenResolver(null);
-    };
-  }, [inviteToken, resetToken]);
 
   const loadGroups = useCallback(async () => {
     const list = await apiFetch<PeladaGroupSummary[]>('/api/groups');
@@ -315,7 +251,6 @@ export default function App() {
       setEditGroupLocation(g.location);
       setEditGroupFullAddress(g.fullAddress ?? '');
       setEditGroupAvulsoFee(String(g.avulsoFee ?? 0));
-      setInviteGuestAvulsoFee(String(g.avulsoFee ?? 0));
     }
 
     setLoadingData(true);
@@ -345,9 +280,6 @@ export default function App() {
     setShowNewPeladaForm(false);
     setShowNewSeasonInline(false);
     setEditingGroupInfo(false);
-    setGeneratedGroupInvite(null);
-    setInviteGuestEmail('');
-    setCopiedGroupInvite(false);
     setAppError(null);
   }
 
@@ -357,20 +289,12 @@ export default function App() {
     setShowNewPeladaForm(false);
     setShowNewSeasonInline(false);
     setEditingGroupInfo(false);
-    setGeneratedGroupInvite(null);
-    setInviteGuestEmail('');
-    setCopiedGroupInvite(false);
     setAppError(null);
     loadGroups().catch(() => {});
   }
 
-  async function handleLogout() {
+  function handleLogout() {
     setInMemoryAuthToken(null);
-    try {
-      await signOut(auth);
-    } catch {
-      // ignore if local auth
-    }
     setAuthUser(null);
     setMyPlayer(null);
     setGroups([]);
@@ -384,8 +308,6 @@ export default function App() {
     setShowSummaryEmailsModal(false);
     setActiveGroupId(null);
     setActivePeladaId(null);
-    setLatestInviteBanner(null);
-    setGeneratedGroupInvite(null);
     setEditingGroupInfo(false);
   }
 
@@ -455,48 +377,11 @@ export default function App() {
         }),
       });
       setEditingGroupInfo(false);
-      setInviteGuestAvulsoFee(String(Number.isFinite(parsedFee) && parsedFee >= 0 ? parsedFee : 0));
       await loadGroups();
     } catch (err: unknown) {
       setAppError(err instanceof Error ? err.message : 'Erro ao atualizar informações da pelada.');
     } finally {
       setSavingGroupInfo(false);
-    }
-  }
-
-  async function handleInvitePlayerToGroup(e: React.FormEvent) {
-    e.preventDefault();
-    if (activeGroupId === null) return;
-    const email = inviteGuestEmail.trim();
-    if (!email || !email.includes('@')) {
-      setAppError('Informe um e-mail válido para convidar o peladeiro.');
-      return;
-    }
-    const parsedFee = Number(inviteGuestAvulsoFee.replace(',', '.'));
-    if (inviteGuestAvulsoFee.trim() !== '' && (!Number.isFinite(parsedFee) || parsedFee < 0)) {
-      setAppError('Informe um valor de avulso válido (maior ou igual a R$ 0,00).');
-      return;
-    }
-    setSendingGroupInvite(true);
-    setAppError(null);
-    setCopiedGroupInvite(false);
-    try {
-      const res = await apiFetch<{ invite: InviteEmailRecord; avulsoFee: number }>(
-        `/api/groups/${activeGroupId}/invite-player`,
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            email,
-            avulsoFee: Number.isFinite(parsedFee) && parsedFee >= 0 ? parsedFee : undefined,
-          }),
-        }
-      );
-      setGeneratedGroupInvite(res.invite);
-      setInviteGuestEmail('');
-    } catch (err: unknown) {
-      setAppError(err instanceof Error ? err.message : 'Erro ao gerar convite por e-mail.');
-    } finally {
-      setSendingGroupInvite(false);
     }
   }
 
@@ -575,38 +460,9 @@ export default function App() {
     }
   }
 
-  async function handleSendInviteFromRoster(p: Player) {
-    if (!p.email) {
-      setAppError(`O jogador ${p.nickname} não possui e-mail cadastrado.`);
-      return;
-    }
-    setAppError(null);
-    try {
-      const res = await apiFetch<{ invite: InviteEmailRecord }>(`/api/admin/players/${p.id}/invite`, {
-        method: 'POST',
-        body: JSON.stringify({ email: p.email }),
-      });
-      setLatestInviteBanner(res.invite);
-    } catch (err: unknown) {
-      setAppError(err instanceof Error ? err.message : 'Erro ao gerar convite.');
-    }
-  }
-
-  if (!authReady) {
-    return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center text-sm text-slate-500">
-        Inicializando QuadraMestre...
-      </div>
-    );
-  }
-
-  if (!authUser || inviteToken || resetToken) {
+  if (!authUser) {
     return (
       <AuthView
-        inviteToken={inviteToken}
-        resetToken={resetToken}
-        onClearInviteToken={clearInviteUrl}
-        onClearResetToken={clearResetUrl}
         onAuthSuccess={(payload) => {
           setAuthUser(payload.user);
           setMyPlayer(payload.player);
@@ -1127,36 +983,7 @@ export default function App() {
             </div>
           )}
 
-          {latestInviteBanner && (
-            <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-5 py-4 flex flex-wrap items-center justify-between gap-3">
-              <div className="text-xs sm:text-sm text-emerald-950">
-                <strong>Convite gerado para {latestInviteBanner.toEmail}:</strong>{' '}
-                <span className="font-mono text-xs break-all">{latestInviteBanner.inviteLink}</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    const url = new URL(latestInviteBanner.inviteLink);
-                    const tok = url.searchParams.get('convite');
-                    if (tok) {
-                      handleLogout().then(() => setInviteToken(tok));
-                    }
-                  }}
-                  className="rounded-lg bg-emerald-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-800 cursor-pointer"
-                >
-                  Simular Acesso do Jogador
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setLatestInviteBanner(null)}
-                  className="text-xs text-emerald-800 hover:underline px-2 cursor-pointer"
-                >
-                  Dispensar
-                </button>
-              </div>
-            </div>
-          )}
+
 
           {appError && (
             <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
@@ -1846,111 +1673,7 @@ export default function App() {
                   </form>
                 )}
 
-                {/* Convida Peladeiro (admin ou peladeiro cadastrado na pelada) */}
-                <div className="rounded-lg border border-emerald-200/80 bg-emerald-50/50 p-3.5 space-y-3">
-                  <form
-                    onSubmit={handleInvitePlayerToGroup}
-                    className="flex flex-col lg:flex-row lg:items-end gap-3"
-                  >
-                    <div className="flex-1 min-w-0">
-                      <label
-                        htmlFor="convida-peladeiro-email"
-                        className="flex items-center gap-1.5 text-xs font-bold text-slate-800 mb-1"
-                      >
-                        <Mail className="h-3.5 w-3.5 text-emerald-700" />
-                        Convida Peladeiro
-                      </label>
-                      <input
-                        id="convida-peladeiro-email"
-                        type="email"
-                        required
-                        value={inviteGuestEmail}
-                        onChange={(e) => setInviteGuestEmail(e.target.value)}
-                        placeholder="Digite o e-mail do convidado para enviar o convite da pelada..."
-                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs sm:text-sm"
-                      />
-                    </div>
 
-                    <div className="w-full lg:w-36">
-                      <label
-                        htmlFor="convida-peladeiro-avulso"
-                        className="block text-[11px] font-semibold text-slate-700 mb-1"
-                      >
-                        Valor do avulso (R$)
-                      </label>
-                      <input
-                        id="convida-peladeiro-avulso"
-                        type="number"
-                        step="0.50"
-                        min={0}
-                        value={inviteGuestAvulsoFee}
-                        onChange={(e) => setInviteGuestAvulsoFee(e.target.value)}
-                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs sm:text-sm tabular-nums"
-                      />
-                    </div>
-
-                    <button
-                      type="submit"
-                      disabled={sendingGroupInvite}
-                      className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-emerald-600 px-4 py-2 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-60 cursor-pointer whitespace-nowrap"
-                    >
-                      <Send className="h-3.5 w-3.5" />
-                      {sendingGroupInvite ? 'Gerando e-mail...' : 'Gerar E-mail de Convite'}
-                    </button>
-                  </form>
-
-                  {generatedGroupInvite && (
-                    <div className="rounded-lg border border-emerald-200 bg-white p-3.5 space-y-2.5">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div className="text-xs">
-                          <span className="font-bold text-emerald-800">
-                            E-mail de convite gerado para {generatedGroupInvite.toEmail}
-                          </span>
-                          <p className="text-[11px] text-slate-500 mt-0.5">
-                            Assunto: {generatedGroupInvite.subject}
-                          </p>
-                        </div>
-                        <div className="flex flex-wrap items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => {
-                              const fullEmailText = `Assunto: ${generatedGroupInvite.subject}\n\n${generatedGroupInvite.bodyText}`;
-                              navigator.clipboard?.writeText(fullEmailText).catch(() => {});
-                              setCopiedGroupInvite(true);
-                            }}
-                            className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-700 hover:bg-slate-50 cursor-pointer"
-                          >
-                            {copiedGroupInvite ? (
-                              <>
-                                <Check className="h-3 w-3 text-emerald-600" /> Copiado
-                              </>
-                            ) : (
-                              <>
-                                <Copy className="h-3 w-3" /> Copiar e-mail
-                              </>
-                            )}
-                          </button>
-                          <a
-                            href={`mailto:${encodeURIComponent(generatedGroupInvite.toEmail)}?subject=${encodeURIComponent(generatedGroupInvite.subject)}&body=${encodeURIComponent(generatedGroupInvite.bodyText)}`}
-                            className="inline-flex items-center gap-1 rounded-md bg-slate-900 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-slate-800"
-                          >
-                            <Mail className="h-3 w-3" /> Abrir no aplicativo de e-mail
-                          </a>
-                          <button
-                            type="button"
-                            onClick={() => setGeneratedGroupInvite(null)}
-                            className="text-[11px] text-slate-500 hover:text-slate-800 px-1.5 cursor-pointer"
-                          >
-                            Fechar
-                          </button>
-                        </div>
-                      </div>
-                      <pre className="whitespace-pre-wrap font-sans text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded-md p-3 leading-relaxed">
-                        {generatedGroupInvite.bodyText}
-                      </pre>
-                    </div>
-                  )}
-                </div>
 
                 {/* Screen selector inside the Pelada */}
                 <div className="flex flex-wrap items-center gap-1.5 rounded-lg bg-slate-100 p-1">
@@ -2652,16 +2375,7 @@ export default function App() {
                                     Votar
                                   </button>
                                 )}
-                                {isAdmin && p.email && !p.userId && (
-                                  <button
-                                    type="button"
-                                    onClick={() => handleSendInviteFromRoster(p)}
-                                    className="inline-flex items-center gap-1 text-slate-600 hover:text-emerald-700 cursor-pointer"
-                                    title="Enviar convite por e-mail"
-                                  >
-                                    <Mail className="h-3.5 w-3.5" /> Convidar
-                                  </button>
-                                )}
+
                                 {canEdit && (
                                   <button
                                     type="button"
@@ -2715,12 +2429,6 @@ export default function App() {
                   onMembersChanged={() => {
                     loadGroupPlayers(activeGroup.id);
                     loadGroups();
-                  }}
-                  onTestInviteLink={(tok) => {
-                    handleLogout().then(() => setInviteToken(tok));
-                  }}
-                  onTestResetLink={(tok) => {
-                    handleLogout().then(() => setResetToken(tok));
                   }}
                 />
               ) : null}
@@ -2832,7 +2540,7 @@ export default function App() {
           groupPeladas={peladas}
           criteriaConfig={activeGroup?.criteriaConfig}
           onClose={() => setEditingPlayer(null)}
-          onSaved={(savedPlayer, invite) => {
+          onSaved={(savedPlayer) => {
             setEditingPlayer(null);
             loadAllSystemPlayers();
             loadNotifications();
@@ -2843,9 +2551,6 @@ export default function App() {
             }
             if (myPlayer && savedPlayer.id === myPlayer.id) {
               setMyPlayer(savedPlayer);
-            }
-            if (invite) {
-              setLatestInviteBanner(invite);
             }
           }}
         />

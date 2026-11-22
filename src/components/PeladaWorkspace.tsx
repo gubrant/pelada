@@ -345,31 +345,20 @@ export function PeladaWorkspace({
     try {
       const nextStatus = pelada.status === 'finished' ? 'in_progress' : 'finished';
       const res = await apiFetch<{
-        financeNotification?: {
-          emailsSent?: number;
+        financeSummary?: {
           chargesCreated?: number;
-          skippedNoPix?: boolean;
-          skippedNoEmail?: string[];
         } | null;
       }>(`/api/peladas/${peladaId}/status`, {
         method: 'PATCH',
         body: JSON.stringify({ status: nextStatus }),
       });
-      if (nextStatus === 'finished' && res.financeNotification) {
-        const fn = res.financeNotification;
-        if (fn.skippedNoPix) {
-          setFinanceBanner(
-            'Pelada encerrada! Configure a chave PIX na aba Financeiro para gerar e enviar automaticamente os e-mails de cobrança aos inadimplentes.'
-          );
-        } else if ((fn.emailsSent ?? 0) > 0) {
-          setFinanceBanner(
-            `Pelada encerrada! ${fn.emailsSent} e-mail(s) de cobrança com chave PIX foram enviados aos participantes pendentes (confira na aba Financeiro).`
-          );
-        } else {
-          setFinanceBanner(
-            'Pelada encerrada! Todos os participantes com e-mail cadastrado já estão com mensalidade/diária em dia.'
-          );
-        }
+      if (nextStatus === 'finished' && res.financeSummary) {
+        const created = res.financeSummary.chargesCreated ?? 0;
+        setFinanceBanner(
+          created > 0
+            ? `Pelada encerrada! ${created} cobrança(s) de diária/mensalidade lançada(s) na aba Financeiro.`
+            : 'Pelada encerrada! Confira o balanço e os pagamentos na aba Financeiro.'
+        );
       }
       await loadDetail();
     } catch (err: unknown) {

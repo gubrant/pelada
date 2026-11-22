@@ -4,9 +4,7 @@ import {
   CheckCircle2,
   Copy,
   Image as ImageIcon,
-  Mail,
   Plus,
-  Send,
   ShieldCheck,
   Trash2,
   Wallet,
@@ -107,13 +105,12 @@ export function PeladaFinanceView({
   const [chargeNotes, setChargeNotes] = useState('');
 
   // Filters & Sub-tabs inside Financeiro
-  const [activeSubView, setActiveSubView] = useState<
-    'overview' | 'payments' | 'entries' | 'emails'
-  >('overview');
+  const [activeSubView, setActiveSubView] = useState<'overview' | 'payments' | 'entries'>(
+    'overview'
+  );
   const [paymentFilter, setPaymentFilter] = useState<'all' | 'pending' | 'paid'>('all');
   const [entryFilter, setEntryFilter] = useState<'all' | FinanceEntryType>('all');
   const [previewImage, setPreviewImage] = useState<{ url: string; title: string } | null>(null);
-  const [copiedEmailId, setCopiedEmailId] = useState<number | null>(null);
 
   const loadFinance = useCallback(async () => {
     setLoading(true);
@@ -307,45 +304,7 @@ export function PeladaFinanceView({
     }
   }
 
-  async function handleSendPixEmails() {
-    setBusy(true);
-    setError(null);
-    setSuccess(null);
-    try {
-      const res = await apiFetch<{
-        emailsSent: number;
-        skippedNoEmail: string[];
-        chargesCreated: number;
-      }>(`/api/groups/${groupId}/finance/send-pix-emails`, {
-        method: 'POST',
-        body: JSON.stringify({
-          peladaId: scopedPeladaId || null,
-          createMissingForPelada: Boolean(scopedPeladaId),
-        }),
-      });
-      if (res.emailsSent === 0) {
-        setSuccess(
-          res.skippedNoEmail.length > 0
-            ? `Nenhum e-mail enviado. Participantes sem e-mail cadastrado: ${res.skippedNoEmail.join(', ')}.`
-            : 'Todos os participantes já estão em dia (nenhum pagamento pendente encontrado).'
-        );
-      } else {
-        setSuccess(
-          `${res.emailsSent} e-mail(s) de cobrança PIX gerado(s) com sucesso.${
-            res.skippedNoEmail.length > 0
-              ? ` Sem e-mail cadastrado: ${res.skippedNoEmail.join(', ')}.`
-              : ''
-          }`
-        );
-        setActiveSubView('emails');
-      }
-      await loadFinance();
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Erro ao gerar e-mails PIX.');
-    } finally {
-      setBusy(false);
-    }
-  }
+
 
   if (loading && !data) {
     return (
@@ -363,7 +322,7 @@ export function PeladaFinanceView({
     );
   }
 
-  const { group, permissions, summary, entries, payments, pixEmails, peladas, participants } = data;
+  const { group, permissions, summary, entries, payments, peladas, participants } = data;
   const isGroupAdmin = permissions.isGroupAdmin;
   const canConfirmPayments = permissions.canConfirmPayments;
 
@@ -379,8 +338,6 @@ export function PeladaFinanceView({
     return true;
   });
 
-  const pendingPaymentsCount = payments.filter((p) => p.status === 'pending').length;
-
   return (
     <div className="space-y-6">
       {/* Header & Main Actions */}
@@ -391,7 +348,7 @@ export function PeladaFinanceView({
           </h3>
           <p className="text-xs sm:text-sm text-slate-500">
             Transparência de caixa, receitas, gastos com comprovantes anexados, débitos pendentes e
-            cobrança via PIX para todos os participantes.
+            controle de mensalidades e diárias dos participantes.
           </p>
           <p className="text-xs text-slate-600">
             Chave PIX atual:{' '}
@@ -447,15 +404,6 @@ export function PeladaFinanceView({
             >
               <Wallet className="h-3.5 w-3.5 text-emerald-600" />
               Lançar Mensalidade / Diária
-            </button>
-            <button
-              type="button"
-              disabled={busy || pendingPaymentsCount === 0}
-              onClick={handleSendPixEmails}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-4 py-2 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-50 cursor-pointer whitespace-nowrap"
-            >
-              <Send className="h-3.5 w-3.5" />
-              Enviar E-mail PIX aos Pendentes ({pendingPaymentsCount})
             </button>
           </div>
         )}
@@ -536,8 +484,7 @@ export function PeladaFinanceView({
                 Configuração de PIX, Caixa Atual e Valores
               </h4>
               <p className="text-xs text-slate-500">
-                Informe a chave PIX que será enviada por e-mail aos peladeiros pendentes ao final da
-                pelada.
+                Informe a chave PIX da pelada, valor em caixa inicial, mensalidade e diária.
               </p>
             </div>
             <span className="text-xs font-medium text-slate-600 inline-flex items-center gap-1">
@@ -948,17 +895,6 @@ export function PeladaFinanceView({
         >
           Caixa, Receitas & Gastos ({filteredEntries.length})
         </button>
-        <button
-          type="button"
-          onClick={() => setActiveSubView('emails')}
-          className={`px-3.5 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap cursor-pointer ${
-            activeSubView === 'emails'
-              ? 'bg-white text-slate-900 shadow-sm'
-              : 'text-slate-600 hover:text-slate-900'
-          }`}
-        >
-          E-mails PIX Enviados ({pixEmails.length})
-        </button>
       </div>
 
       {/* 1. Balanço para controle de todos os participantes */}
@@ -1090,11 +1026,6 @@ export function PeladaFinanceView({
                           {pay.paymentType === 'mensalidade' ? 'Mensalidade' : 'Diária'} ·{' '}
                           {pay.referenceLabel}
                         </span>
-                        {pay.pixEmailSentAt && (
-                          <span className="text-[11px] text-slate-500">
-                            PIX enviado em {new Date(pay.pixEmailSentAt).toLocaleDateString('pt-BR')}
-                          </span>
-                        )}
                       </td>
                       <td className="px-4 py-3 text-right font-mono tabular-nums font-semibold text-slate-900">
                         {formatBrl(pay.amount)}
@@ -1297,83 +1228,7 @@ export function PeladaFinanceView({
         </div>
       )}
 
-      {/* 4. E-mails PIX enviados aos pendentes */}
-      {activeSubView === 'emails' && (
-        <div className="rounded-xl border border-slate-200 bg-white overflow-hidden">
-          <div className="px-5 py-3.5 border-b border-slate-200">
-            <h4 className="text-sm font-bold text-slate-900">
-              E-mails de Cobrança PIX Enviados ({pixEmails.length})
-            </h4>
-            <p className="text-xs text-slate-500">
-              Enviados automaticamente ao finalizar uma pelada ou sob demanda para quem está com
-              mensalidade ou diária em aberto.
-            </p>
-          </div>
 
-          {pixEmails.length === 0 ? (
-            <div className="p-8 text-center text-sm text-slate-500">
-              Nenhum e-mail de cobrança PIX foi gerado ainda.
-            </div>
-          ) : (
-            <div className="divide-y divide-slate-100">
-              {pixEmails.map((em) => (
-                <div key={em.id} className="p-4 space-y-2">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="text-xs">
-                      <strong className="text-slate-900">
-                        {em.playerNickname || em.toEmail} ({em.toEmail})
-                      </strong>
-                      <p className="text-slate-500">{em.subject}</p>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <span className="font-mono tabular-nums text-xs font-bold text-emerald-700">
-                        {formatBrl(em.amount)}
-                      </span>
-                      <span className="text-[11px] text-slate-400">
-                        {new Date(em.sentAt).toLocaleDateString('pt-BR')}
-                      </span>
-                    </div>
-                  </div>
-
-                  <pre className="whitespace-pre-wrap font-sans text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded-md p-3">
-                    {em.bodyText}
-                  </pre>
-
-                  <div className="flex flex-wrap items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        navigator.clipboard
-                          ?.writeText(`Assunto: ${em.subject}\n\n${em.bodyText}`)
-                          .catch(() => {});
-                        setCopiedEmailId(em.id);
-                        setTimeout(() => setCopiedEmailId(null), 2000);
-                      }}
-                      className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-700 hover:bg-slate-50 cursor-pointer"
-                    >
-                      {copiedEmailId === em.id ? (
-                        <>
-                          <Check className="h-3 w-3 text-emerald-600" /> Copiado
-                        </>
-                      ) : (
-                        <>
-                          <Copy className="h-3 w-3" /> Copiar E-mail
-                        </>
-                      )}
-                    </button>
-                    <a
-                      href={`mailto:${encodeURIComponent(em.toEmail)}?subject=${encodeURIComponent(em.subject)}&body=${encodeURIComponent(em.bodyText)}`}
-                      className="inline-flex items-center gap-1 rounded-md bg-slate-900 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-slate-800"
-                    >
-                      <Mail className="h-3 w-3" /> Abrir no E-mail
-                    </a>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
 
       {/* Lightbox for attached receipt images */}
       {previewImage && (

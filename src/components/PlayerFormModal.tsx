@@ -8,7 +8,6 @@ import {
   FUTSAL_POSITIONS,
   type FutsalPosition,
   type GroupCriterion,
-  type InviteEmailRecord,
   PLAYER_CATEGORIES,
   type PeladaSummary,
   type Player,
@@ -25,7 +24,7 @@ interface PlayerFormModalProps {
   groupPeladas?: PeladaSummary[];
   criteriaConfig?: GroupCriterion[];
   onClose: () => void;
-  onSaved: (player: Player, invite?: InviteEmailRecord | null) => void;
+  onSaved: (player: Player) => void;
 }
 
 export function PlayerFormModal({
@@ -86,9 +85,7 @@ export function PlayerFormModal({
 
   const [castInitialVote, setCastInitialVote] = useState(false);
 
-  const [accessMode, setAccessMode] = useState<'none' | 'invite' | 'password'>(
-    isAdmin ? 'invite' : 'none'
-  );
+  const [accessMode, setAccessMode] = useState<'none' | 'password'>('none');
   const [initialPassword, setInitialPassword] = useState('');
 
   const [saving, setSaving] = useState(false);
@@ -138,7 +135,7 @@ export function PlayerFormModal({
           method: 'PUT',
           body: JSON.stringify(payload),
         });
-        onSaved(res.player, null);
+        onSaved(res.player);
       } else {
         const effectiveCategory: PlayerCategory = isAdmin ? category : 'eventual';
         const effectiveExclusivity = isAdmin
@@ -146,7 +143,7 @@ export function PlayerFormModal({
           : exclusivity === 'encounter'
             ? 'encounter'
             : 'group';
-        const res = await apiFetch<{ player: Player; invite: InviteEmailRecord | null }>(
+        const res = await apiFetch<{ player: Player }>(
           '/api/players',
           {
             method: 'POST',
@@ -178,7 +175,7 @@ export function PlayerFormModal({
             }),
           }
         );
-        onSaved(res.player, res.invite);
+        onSaved(res.player);
       }
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Erro ao salvar jogador.');
@@ -557,18 +554,7 @@ export function PlayerFormModal({
                 Acesso do Jogador ao Aplicativo
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-                <button
-                  type="button"
-                  onClick={() => setAccessMode('invite')}
-                  className={`rounded-lg border px-3 py-2 text-xs font-semibold text-left cursor-pointer ${
-                    accessMode === 'invite'
-                      ? 'border-emerald-600 bg-emerald-50 text-emerald-900'
-                      : 'border-slate-200 text-slate-600 hover:bg-slate-50'
-                  }`}
-                >
-                  Enviar convite por e-mail
-                </button>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                 <button
                   type="button"
                   onClick={() => setAccessMode('password')}
@@ -578,7 +564,7 @@ export function PlayerFormModal({
                       : 'border-slate-200 text-slate-600 hover:bg-slate-50'
                   }`}
                 >
-                  Definir senha agora
+                  Definir login e senha agora
                 </button>
                 <button
                   type="button"
@@ -596,7 +582,7 @@ export function PlayerFormModal({
               {accessMode === 'password' && (
                 <div>
                   <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Senha inicial do jogador (mín. 6 caracteres)
+                    Senha inicial do jogador (mín. 6 dígitos)
                   </label>
                   <input
                     type="password"
@@ -606,14 +592,10 @@ export function PlayerFormModal({
                     placeholder="Defina a senha de acesso"
                     className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-emerald-600 focus:outline-none"
                   />
+                  <p className="text-[11px] text-slate-500 mt-1">
+                    O login será o e-mail informado acima na ficha.
+                  </p>
                 </div>
-              )}
-
-              {accessMode === 'invite' && (
-                <p className="text-xs text-slate-500">
-                  Ao salvar com um e-mail válido, o sistema gera o e-mail de convite com link único
-                  para o peladeiro criar login, senha e atualizar seu cadastro.
-                </p>
               )}
             </div>
           )}

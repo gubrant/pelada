@@ -1,5 +1,4 @@
 let inMemoryToken: string | null = null;
-let firebaseTokenResolver: (() => Promise<string | null>) | null = null;
 
 export function setInMemoryAuthToken(token: string | null) {
   inMemoryToken = token;
@@ -9,18 +8,11 @@ export function getInMemoryAuthToken(): string | null {
   return inMemoryToken;
 }
 
-export function registerFirebaseTokenResolver(fn: (() => Promise<string | null>) | null) {
-  firebaseTokenResolver = fn;
-}
-
 export async function apiFetch<T = unknown>(
   url: string,
   options: RequestInit = {}
 ): Promise<T> {
-  let token = inMemoryToken;
-  if (!token && firebaseTokenResolver) {
-    token = await firebaseTokenResolver();
-  }
+  const token = inMemoryToken;
 
   const headers = new Headers(options.headers || {});
   if (!headers.has('Content-Type') && options.body && !(options.body instanceof FormData)) {

@@ -409,30 +409,7 @@ export const peladaParticipantPayments = pgTable('pelada_participant_payments', 
   confirmedByRole: text('confirmed_by_role'),
   notes: text('notes'),
   attachmentUrl: text('attachment_url'),
-  pixEmailSentAt: timestamp('pix_email_sent_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
-});
-
-export const peladaPixPaymentEmails = pgTable('pelada_pix_payment_emails', {
-  id: serial('id').primaryKey(),
-  groupId: integer('group_id')
-    .references(() => peladaGroups.id, { onDelete: 'cascade' })
-    .notNull(),
-  peladaId: integer('pelada_id').references(() => peladas.id, { onDelete: 'set null' }),
-  paymentId: integer('payment_id').references(() => peladaParticipantPayments.id, {
-    onDelete: 'cascade',
-  }),
-  userId: integer('user_id').references(() => users.id, { onDelete: 'cascade' }),
-  playerId: integer('player_id')
-    .references(() => players.id, { onDelete: 'cascade' })
-    .notNull(),
-  toEmail: text('to_email').notNull(),
-  subject: text('subject').notNull(),
-  bodyText: text('body_text').notNull(),
-  pixKey: text('pix_key').notNull(),
-  amount: doublePrecision('amount').notNull(),
-  status: text('status').notNull().default('sent'),
-  sentAt: timestamp('sent_at').defaultNow().notNull(),
 });
 
 export const passwordResetTokens = pgTable('password_reset_tokens', {

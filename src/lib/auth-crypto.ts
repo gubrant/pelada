@@ -5,9 +5,13 @@ const scryptAsync = promisify(crypto.scrypt);
 
 const EPHEMERAL_FALLBACK_SECRET = crypto.randomBytes(32).toString('hex');
 
+export function hasConfiguredSessionSecret(): boolean {
+  return Boolean(process.env.SESSION_SECRET && process.env.SESSION_SECRET.trim().length >= 16);
+}
+
 function getSessionSecret(): string {
-  return process.env.SESSION_SECRET && process.env.SESSION_SECRET.trim().length >= 16
-    ? process.env.SESSION_SECRET
+  return hasConfiguredSessionSecret()
+    ? process.env.SESSION_SECRET!.trim()
     : EPHEMERAL_FALLBACK_SECRET;
 }
 
@@ -76,16 +80,4 @@ export function verifySessionToken(token: string): SessionPayload | null {
   } catch {
     return null;
   }
-}
-
-export function generateInviteToken(): string {
-  return crypto.randomBytes(24).toString('base64url');
-}
-
-export function generateResetToken(): string {
-  return crypto.randomBytes(32).toString('base64url');
-}
-
-export function hashResetToken(token: string): string {
-  return crypto.createHash('sha256').update(token).digest('hex');
 }
