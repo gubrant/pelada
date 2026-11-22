@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
-import { signInWithPopup } from 'firebase/auth';
-import { CheckCircle2, KeyRound, Mail, ShieldCheck, UserPlus } from 'lucide-react';
+import { sendPasswordResetEmail, signInWithPopup } from 'firebase/auth';
+import { ArrowLeft, CheckCircle2, KeyRound, Mail, ShieldCheck, UserPlus } from 'lucide-react';
 import { auth, googleAuthProvider } from '../lib/firebase';
 import { apiFetch, setInMemoryAuthToken } from '../lib/api';
 import {
@@ -22,19 +22,37 @@ interface AuthSuccessPayload {
 
 interface AuthViewProps {
   inviteToken: string | null;
+  resetToken: string | null;
   onClearInviteToken: () => void;
+  onClearResetToken: () => void;
   onAuthSuccess: (payload: AuthSuccessPayload) => void;
 }
 
-export function AuthView({ inviteToken, onClearInviteToken, onAuthSuccess }: AuthViewProps) {
-  const [mode, setMode] = useState<'login' | 'bootstrap' | 'invite'>(
-    inviteToken ? 'invite' : 'login'
+export function AuthView({
+  inviteToken,
+  resetToken,
+  onClearInviteToken,
+  onClearResetToken,
+  onAuthSuccess,
+}: AuthViewProps) {
+  const [mode, setMode] = useState<'login' | 'bootstrap' | 'invite' | 'forgot' | 'reset'>(
+    resetToken ? 'reset' : inviteToken ? 'invite' : 'login'
   );
   const [needsAdminSetup, setNeedsAdminSetup] = useState(false);
 
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [adminName, setAdminName] = useState('');
+
+  // Password recovery & reset states
+  const [forgotEmail, setForgotEmail] = useState('');
+  const [forgotSuccess, setForgotSuccess] = useState<string | null>(null);
+  const [resetEmail, setResetEmail] = useState('');
+  const [resetName, setResetName] = useState('');
+  const [resetPassword, setResetPassword] = useState('');
+  const [resetPasswordConfirm, setResetPasswordConfirm] = useState('');
+  const [validatingReset, setValidatingReset] = useState(false);
+  const [resetTokenValid, setResetTokenValid] = useState(false);
 
   // Invite registration states
   const [inviteEmail, setInviteEmail] = useState('');
@@ -65,6 +83,7 @@ export function AuthView({ inviteToken, onClearInviteToken, onAuthSuccess }: Aut
     if (!inviteToken) return;
     setMode('invite');
     setError(null);
+    setForgotSuccess(null);
     apiFetch<{ email: string; name: string; player: Player | null }>(
       `/api/auth/invite?token=${encodeURIComponent(inviteToken)}`
     )
@@ -82,6 +101,30 @@ export function AuthView({ inviteToken, onClearInviteToken, onAuthSuccess }: Aut
         setError(err.message);
       });
   }, [inviteToken]);
+
+  useEffect(() => {
+    if (!resetToken) return;
+    setMode('reset');
+    setError(null);
+    setForgotSuccess(null);
+    setValidatingReset(true);
+    setResetTokenValid(false);
+    apiFetch<{ email: string; name: string }>(
+      `/api/auth/reset-password?token=${encodeURIComponent(resetToken)}`
+    )
+      .then((res) => {
+        setResetEmail(res.email);
+        setResetName(res.name);
+        setResetTokenValid(true);
+      })
+      .catch((err: Error) => {
+        setError(err.message);
+        setResetTokenValid(false);
+      })
+      .finally(() => {
+        setValidatingReset(false);
+      });
+  }, [resetToken]);
 
   async function handleGoogleLogin() {
     setError(null);
@@ -118,6 +161,67 @@ export function AuthView({ inviteToken, onClearInviteToken, onAuthSuccess }: Aut
       onAuthSuccess(res);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'E-mail ou senha inválidos.');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleForgotPassword(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setForgotSuccess(null);
+    const trimmedEmail = forgotEmail.trim().toLowerCase();
+    if (!trimmedEmail || !trimmedEmail.includes('@')) {
+      setError('Informe um e-mail válido.');
+      return;
+    }
+    setLoading(true);
+    try {
+      const res = await apiFetch<{ ok: boolean; message: string }>('/api/auth/forgot-password', {
+        method: 'POST',
+        body: JSON.stringify({ email: trimmedEmail }),
+      });
+      // Também dispara fluxo nativo do Firebase Auth caso a conta utilize e-mail/senha Firebase
+      sendPasswordResetEmail(auth, trimmedEmail).catch(() => {});
+      setForgotSuccess(res.message);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Falha ao solicitar recuperação de senha.');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleResetPasswordSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    if (!resetToken) return;
+    if (resetPassword.length < 6) {
+      setError('A nova senha deve ter pelo menos 6 caracteres.');
+      return;
+    }
+    if (resetPassword !== resetPasswordConfirm) {
+      setError('As senhas digitadas não conferem.');
+      return;
+    }
+    setLoading(true);
+    try {
+      const res = await apiFetch<{ token: string; user: AuthUser; player: Player | null }>(
+        '/api/auth/reset-password',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            token: resetToken,
+            password: resetPassword,
+          }),
+        }
+      );
+      setInMemoryAuthToken(res.token);
+      setResetPassword('');
+      setResetPasswordConfirm('');
+      onClearResetToken();
+      onAuthSuccess(res);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Não foi possível redefinir sua senha.');
     } finally {
       setLoading(false);
     }
@@ -245,16 +349,24 @@ export function AuthView({ inviteToken, onClearInviteToken, onAuthSuccess }: Aut
               <h2 className="font-display text-3xl font-bold text-slate-900">
                 {mode === 'invite'
                   ? 'Cadastro do Peladeiro'
-                  : mode === 'bootstrap'
-                    ? 'Configurar Administrador'
-                    : 'Entrar na Quadra'}
+                  : mode === 'reset'
+                    ? 'Redefinir Senha'
+                    : mode === 'forgot'
+                      ? 'Recuperar Senha'
+                      : mode === 'bootstrap'
+                        ? 'Configurar Administrador'
+                        : 'Entrar na Quadra'}
               </h2>
               <p className="text-sm text-slate-500 mt-1">
                 {mode === 'invite'
                   ? 'Defina sua senha e complete sua ficha de jogador.'
-                  : mode === 'bootstrap'
-                    ? 'Crie o primeiro login e senha de administrador.'
-                    : 'Acesse com sua conta Google ou e-mail e senha.'}
+                  : mode === 'reset'
+                    ? 'Escolha uma nova senha para voltar a acessar sua pelada.'
+                    : mode === 'forgot'
+                      ? 'Informe seu e-mail para receber o link de alteração de senha.'
+                      : mode === 'bootstrap'
+                        ? 'Crie o primeiro login e senha de administrador.'
+                        : 'Acesse com sua conta Google ou e-mail e senha.'}
               </p>
             </div>
           </div>
@@ -262,6 +374,20 @@ export function AuthView({ inviteToken, onClearInviteToken, onAuthSuccess }: Aut
           {error && (
             <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-3.5 py-2.5 text-sm text-red-700">
               {error}
+            </div>
+          )}
+
+          {forgotSuccess && (
+            <div className="mb-4 rounded-lg border border-emerald-200 bg-emerald-50 px-3.5 py-3 text-sm text-emerald-800 space-y-1">
+              <p className="font-semibold flex items-center gap-1.5">
+                <CheckCircle2 className="h-4 w-4 text-emerald-700 shrink-0" />
+                Solicitação enviada!
+              </p>
+              <p className="text-xs leading-relaxed">{forgotSuccess}</p>
+              <p className="text-[11px] text-emerald-700">
+                Verifique sua caixa de entrada e spam. Se você costuma entrar com Google, também pode
+                clicar diretamente em &ldquo;Entrar com Google&rdquo;.
+              </p>
             </div>
           )}
 
@@ -467,6 +593,153 @@ export function AuthView({ inviteToken, onClearInviteToken, onAuthSuccess }: Aut
                 Voltar para tela de login
               </button>
             </form>
+          ) : mode === 'forgot' ? (
+            <form onSubmit={handleForgotPassword} className="space-y-4">
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  E-mail cadastrado
+                </label>
+                <div className="relative">
+                  <Mail className="h-4 w-4 text-slate-400 absolute left-3 top-2.5" />
+                  <input
+                    type="email"
+                    required
+                    value={forgotEmail}
+                    onChange={(e) => setForgotEmail(e.target.value)}
+                    placeholder="seu@email.com"
+                    className="w-full rounded-lg border border-slate-300 pl-9 pr-3 py-2 text-sm focus:border-emerald-600 focus:outline-none"
+                  />
+                </div>
+                <p className="text-[11px] text-slate-500 mt-1.5">
+                  Enviaremos um e-mail com o link para você cadastrar uma nova senha (válido por 1
+                  hora).
+                </p>
+              </div>
+
+              <button
+                type="submit"
+                disabled={loading}
+                className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-60 cursor-pointer"
+              >
+                <Mail className="h-4 w-4" />
+                {loading ? 'Enviando...' : 'Enviar E-mail de Recuperação'}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setError(null);
+                  setForgotSuccess(null);
+                  setMode('login');
+                }}
+                className="w-full inline-flex items-center justify-center gap-1.5 text-xs font-medium text-slate-500 hover:text-slate-800 cursor-pointer"
+              >
+                <ArrowLeft className="h-3.5 w-3.5" />
+                Voltar para tela de login
+              </button>
+            </form>
+          ) : mode === 'reset' ? (
+            validatingReset ? (
+              <div className="py-8 text-center text-sm text-slate-500">
+                Validando link de recuperação de senha...
+              </div>
+            ) : !resetTokenValid ? (
+              <div className="space-y-4">
+                <p className="text-xs text-slate-600">
+                  Você pode solicitar um novo link de alteração de senha informando seu e-mail.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onClearResetToken();
+                    setError(null);
+                    setForgotEmail(email);
+                    setMode('forgot');
+                  }}
+                  className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-700 cursor-pointer"
+                >
+                  <Mail className="h-4 w-4" />
+                  Solicitar novo link por e-mail
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onClearResetToken();
+                    setError(null);
+                    setMode('login');
+                  }}
+                  className="w-full inline-flex items-center justify-center gap-1.5 text-xs text-slate-500 hover:text-slate-800 cursor-pointer"
+                >
+                  <ArrowLeft className="h-3.5 w-3.5" />
+                  Voltar para tela de login
+                </button>
+              </div>
+            ) : (
+              <form onSubmit={handleResetPasswordSubmit} className="space-y-4">
+                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-xs text-slate-700">
+                  Redefinindo senha para <strong className="text-slate-900">{resetName}</strong> (
+                  {resetEmail})
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Nova senha
+                  </label>
+                  <div className="relative">
+                    <KeyRound className="h-4 w-4 text-slate-400 absolute left-3 top-2.5" />
+                    <input
+                      type="password"
+                      required
+                      minLength={6}
+                      value={resetPassword}
+                      onChange={(e) => setResetPassword(e.target.value)}
+                      placeholder="Mínimo 6 caracteres"
+                      className="w-full rounded-lg border border-slate-300 pl-9 pr-3 py-2 text-sm focus:border-emerald-600 focus:outline-none"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Confirmar nova senha
+                  </label>
+                  <div className="relative">
+                    <KeyRound className="h-4 w-4 text-slate-400 absolute left-3 top-2.5" />
+                    <input
+                      type="password"
+                      required
+                      minLength={6}
+                      value={resetPasswordConfirm}
+                      onChange={(e) => setResetPasswordConfirm(e.target.value)}
+                      placeholder="Repita a nova senha"
+                      className="w-full rounded-lg border border-slate-300 pl-9 pr-3 py-2 text-sm focus:border-emerald-600 focus:outline-none"
+                    />
+                  </div>
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-60 cursor-pointer"
+                >
+                  <CheckCircle2 className="h-4 w-4" />
+                  {loading ? 'Salvando nova senha...' : 'Salvar Nova Senha e Entrar'}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    onClearResetToken();
+                    setError(null);
+                    setMode('login');
+                  }}
+                  className="w-full inline-flex items-center justify-center gap-1.5 text-xs text-slate-500 hover:text-slate-800 cursor-pointer"
+                >
+                  <ArrowLeft className="h-3.5 w-3.5" />
+                  Voltar para tela de login
+                </button>
+              </form>
+            )
           ) : (
             <div className="space-y-5">
               <button
@@ -520,9 +793,23 @@ export function AuthView({ inviteToken, onClearInviteToken, onAuthSuccess }: Aut
                   </div>
                 </div>
                 <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Senha
-                  </label>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="block text-xs font-semibold text-slate-700">
+                      Senha
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setError(null);
+                        setForgotSuccess(null);
+                        setForgotEmail(email);
+                        setMode('forgot');
+                      }}
+                      className="text-xs font-semibold text-emerald-700 hover:text-emerald-800 hover:underline cursor-pointer"
+                    >
+                      Esqueci minha senha
+                    </button>
+                  </div>
                   <div className="relative">
                     <KeyRound className="h-4 w-4 text-slate-400 absolute left-3 top-2.5" />
                     <input

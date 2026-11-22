@@ -81,3 +81,11 @@ export function verifySessionToken(token: string): SessionPayload | null {
 export function generateInviteToken(): string {
   return crypto.randomBytes(24).toString('base64url');
 }
+
+export function generateResetToken(): string {
+  return crypto.randomBytes(32).toString('base64url');
+}
+
+export function hashResetToken(token: string): string {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}

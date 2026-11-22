@@ -7,10 +7,15 @@ import {
   inviteEmails,
   matchEvents,
   matches,
+  passwordResetEmails,
+  passwordResetTokens,
   peladaAttendances,
+  peladaFinanceEntries,
   peladaGroupMembers,
   peladaGroups,
   peladaJoinRequests,
+  peladaParticipantPayments,
+  peladaPixPaymentEmails,
   peladaTeams,
   peladas,
   playerEvaluations,
@@ -22,7 +27,9 @@ import {
 } from '../db/schema.ts';
 import {
   generateInviteToken,
+  generateResetToken,
   hashPassword,
+  hashResetToken,
   signSessionToken,
   verifyPassword,
 } from '../lib/auth-crypto.ts';
@@ -61,6 +68,17 @@ const VALID_POSITIONS = new Set([
 ]);
 const VALID_FEET = new Set(['Destro', 'Canhoto', 'Ambidestro']);
 const VALID_CATEGORIES = new Set(['mensalista', 'avulso', 'eventual']);
+const VALID_ADMIN_TITLES = new Set([
+  'presidente',
+  'tesoureiro',
+  'presidente_tesoureiro',
+  'administrador',
+]);
+const FINANCIAL_CONFIRMER_TITLES = new Set([
+  'presidente',
+  'tesoureiro',
+  'presidente_tesoureiro',
+]);
 
 function categoryPriority(cat: string): number {
   if (cat === 'mensalista') return 0;
@@ -95,13 +113,55 @@ function sanitizeImageUrl(url: unknown): string | null {
   return null;
 }
 
-function getBaseAppUrl(req: AuthRequest): string {
-  if (process.env.APP_URL && process.env.APP_URL.startsWith('http')) {
-    return process.env.APP_URL.replace(/\/$/, '');
+function getBaseAppUrl(req: Pick<AuthRequest, 'headers' | 'protocol'>): string {
+  const configured = process.env.APP_URL?.trim();
+  if (configured && configured.startsWith('http') && !configured.includes('MY_APP_URL')) {
+    return configured.replace(/\/$/, '');
   }
-  const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
-  const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost:3000';
+  const rawProto = String(req.headers['x-forwarded-proto'] || req.protocol || 'http')
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
+  const proto = rawProto === 'https' ? 'https' : 'http';
+  const rawHost = String(req.headers['x-forwarded-host'] || req.headers.host || 'localhost:3000')
+    .split(',')[0]
+    .trim()
+    .replace(/[^a-zA-Z0-9.:-]/g, '');
+  const host = rawHost || 'localhost:3000';
   return `${proto}://${host}`;
+}
+
+async function sendTransactionalEmail(params: {
+  toEmail: string;
+  subject: string;
+  bodyText: string;
+}): Promise<'sent' | 'queued'> {
+  const apiKey = process.env.RESEND_API_KEY?.trim();
+  if (!apiKey) return 'queued';
+  const from = process.env.EMAIL_FROM?.trim() || 'QuadraMestre <onboarding@resend.dev>';
+  try {
+    const resp = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from,
+        to: [params.toEmail],
+        subject: params.subject,
+        text: params.bodyText,
+      }),
+    });
+    if (!resp.ok) {
+      console.warn('Falha ao enviar e-mail transacional via Resend:', resp.status);
+      return 'queued';
+    }
+    return 'sent';
+  } catch (err) {
+    console.warn('Erro de rede ao enviar e-mail transacional:', err);
+    return 'queued';
+  }
 }
 
 function maskPlayerForViewer(
@@ -212,6 +272,61 @@ async function isUserAdminOfGroup(
     )
     .limit(1);
   return memberRow.length > 0;
+}
+
+async function getGroupFinancialPermission(
+  authUser: NonNullable<AuthRequest['authUser']>,
+  groupId: number
+): Promise<{
+  isGroupAdmin: boolean;
+  myAdminTitle: 'presidente' | 'tesoureiro' | 'presidente_tesoureiro' | 'administrador' | null;
+  canConfirmPayments: boolean;
+}> {
+  const groupRows = await db
+    .select({ ownerUserId: peladaGroups.ownerUserId })
+    .from(peladaGroups)
+    .where(eq(peladaGroups.id, groupId))
+    .limit(1);
+  const isOwner = groupRows[0]?.ownerUserId === authUser.id;
+
+  const conds = [eq(peladaGroupMembers.userId, authUser.id)];
+  if (authUser.playerId) conds.push(eq(peladaGroupMembers.playerId, authUser.playerId));
+
+  const memberRows = await db
+    .select()
+    .from(peladaGroupMembers)
+    .where(and(eq(peladaGroupMembers.groupId, groupId), or(...conds)))
+    .limit(1);
+
+  const memberRow = memberRows[0] ?? null;
+  const isMemberAdmin = memberRow?.memberRole === 'admin';
+  const isGroupAdmin = authUser.role === 'admin' || isOwner || isMemberAdmin;
+
+  let myAdminTitle: 'presidente' | 'tesoureiro' | 'presidente_tesoureiro' | 'administrador' | null =
+    null;
+
+  if (memberRow?.memberRole === 'admin') {
+    if (memberRow.adminTitle && VALID_ADMIN_TITLES.has(memberRow.adminTitle)) {
+      myAdminTitle = memberRow.adminTitle as
+        | 'presidente'
+        | 'tesoureiro'
+        | 'presidente_tesoureiro'
+        | 'administrador';
+    } else if (isOwner) {
+      myAdminTitle = 'presidente_tesoureiro';
+    } else {
+      myAdminTitle = 'administrador';
+    }
+  } else if (isOwner) {
+    myAdminTitle = 'presidente_tesoureiro';
+  } else if (authUser.role === 'admin') {
+    myAdminTitle = 'administrador';
+  }
+
+  const canConfirmPayments =
+    myAdminTitle !== null && FINANCIAL_CONFIRMER_TITLES.has(myAdminTitle);
+
+  return { isGroupAdmin, myAdminTitle, canConfirmPayments };
 }
 
 async function notifyPeladaAdminsForNewPlayer(params: {
@@ -597,6 +712,7 @@ async function upsertGroupMembership(params: {
   userId?: number | null;
   playerId?: number | null;
   memberRole?: 'admin' | 'member';
+  adminTitle?: string | null;
   playerCategory?: string;
   accessPeladaId?: number | null;
   accessExpiresAt?: Date | null;
@@ -608,6 +724,7 @@ async function upsertGroupMembership(params: {
     userId = null,
     playerId = null,
     memberRole = 'member',
+    adminTitle,
     playerCategory,
     accessPeladaId,
     accessExpiresAt,
@@ -626,6 +743,14 @@ async function upsertGroupMembership(params: {
     .where(and(eq(peladaGroupMembers.groupId, groupId), or(...conditions)));
 
   const resolvedCat = VALID_CATEGORIES.has(playerCategory ?? '') ? playerCategory! : 'mensalista';
+  const resolvedAdminTitle =
+    adminTitle !== undefined
+      ? adminTitle && VALID_ADMIN_TITLES.has(adminTitle)
+        ? adminTitle
+        : null
+      : memberRole === 'admin'
+        ? 'administrador'
+        : null;
 
   if (existing.length === 0) {
     const inserted = await db
@@ -635,6 +760,7 @@ async function upsertGroupMembership(params: {
         userId,
         playerId,
         memberRole,
+        adminTitle: memberRole === 'admin' ? resolvedAdminTitle : null,
         playerCategory: resolvedCat,
         accessPeladaId: accessPeladaId ?? null,
         accessExpiresAt: accessExpiresAt ?? null,
@@ -658,6 +784,12 @@ async function upsertGroupMembership(params: {
     playerCategory && VALID_CATEGORIES.has(playerCategory)
       ? playerCategory
       : primary.playerCategory;
+  const nextAdminTitle =
+    adminTitle !== undefined
+      ? adminTitle && VALID_ADMIN_TITLES.has(adminTitle)
+        ? adminTitle
+        : null
+      : primary.adminTitle ?? (mergedRole === 'admin' ? 'administrador' : null);
 
   const updated = await db
     .update(peladaGroupMembers)
@@ -665,6 +797,7 @@ async function upsertGroupMembership(params: {
       userId: mergedUserId,
       playerId: mergedPlayerId,
       memberRole: mergedRole,
+      adminTitle: mergedRole === 'admin' ? nextAdminTitle : null,
       playerCategory: mergedCategory,
       ...(accessPeladaId !== undefined ? { accessPeladaId } : {}),
       ...(accessExpiresAt !== undefined ? { accessExpiresAt } : {}),
@@ -842,6 +975,193 @@ apiRouter.post('/auth/login', async (req, res) => {
   } catch (error) {
     console.error('Erro ao realizar login:', error);
     res.status(500).json({ error: 'Erro interno ao autenticar.' });
+  }
+});
+
+apiRouter.post('/auth/forgot-password', async (req, res) => {
+  try {
+    const email = String(req.body?.email ?? '').trim().toLowerCase();
+    if (!email || !email.includes('@')) {
+      return res.status(400).json({ error: 'Informe um e-mail válido.' });
+    }
+
+    const found = await db.select().from(users).where(eq(users.email, email)).limit(1);
+    if (found.length > 0 && found[0].active) {
+      const user = found[0];
+      const rawToken = generateResetToken();
+      const tokenHash = hashResetToken(rawToken);
+      const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+
+      await db
+        .update(passwordResetTokens)
+        .set({ usedAt: new Date() })
+        .where(and(eq(passwordResetTokens.userId, user.id), isNull(passwordResetTokens.usedAt)));
+
+      await db.insert(passwordResetTokens).values({
+        userId: user.id,
+        email: user.email,
+        tokenHash,
+        expiresAt,
+      });
+
+      const baseUrl = getBaseAppUrl(req);
+      const resetLink = `${baseUrl}/?redefinir=${encodeURIComponent(rawToken)}`;
+      const subject = 'Recuperação de senha — QuadraMestre';
+      const bodyText = `Olá, ${user.name}!\n\nRecebemos uma solicitação para redefinir sua senha de acesso ao QuadraMestre.\n\nAcesse o link abaixo para escolher uma nova senha (válido por 1 hora):\n${resetLink}\n\nSe você não solicitou esta alteração, pode ignorar este e-mail com segurança.`;
+
+      const deliveryStatus = await sendTransactionalEmail({
+        toEmail: user.email,
+        subject,
+        bodyText,
+      });
+
+      await db.insert(passwordResetEmails).values({
+        userId: user.id,
+        toEmail: user.email,
+        subject,
+        bodyText,
+        resetLink,
+        status: deliveryStatus,
+      });
+    }
+
+    res.json({
+      ok: true,
+      message:
+        'Se existir uma conta cadastrada com este e-mail, enviaremos um link para redefinir sua senha.',
+    });
+  } catch (error) {
+    console.error('Erro ao solicitar recuperação de senha:', error);
+    res.status(500).json({ error: 'Não foi possível processar a solicitação de recuperação.' });
+  }
+});
+
+apiRouter.get('/auth/reset-password', async (req, res) => {
+  try {
+    const rawToken = String(req.query?.token ?? '').trim();
+    if (!rawToken) {
+      return res.status(400).json({ error: 'Token de recuperação ausente.' });
+    }
+
+    const tokenHash = hashResetToken(rawToken);
+    const rows = await db
+      .select()
+      .from(passwordResetTokens)
+      .where(eq(passwordResetTokens.tokenHash, tokenHash))
+      .limit(1);
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Link de recuperação inválido.' });
+    }
+
+    const record = rows[0];
+    if (record.usedAt) {
+      return res.status(410).json({
+        error: 'Este link de recuperação já foi utilizado. Solicite um novo na tela de login.',
+      });
+    }
+    if (record.expiresAt.getTime() < Date.now()) {
+      return res.status(410).json({
+        error: 'Este link de recuperação expirou. Solicite um novo na tela de login.',
+      });
+    }
+
+    const userRows = await db.select().from(users).where(eq(users.id, record.userId)).limit(1);
+    if (userRows.length === 0 || !userRows[0].active) {
+      return res.status(404).json({ error: 'Conta de usuário não encontrada ou inativa.' });
+    }
+
+    res.json({
+      email: userRows[0].email,
+      name: userRows[0].name,
+    });
+  } catch (error) {
+    console.error('Erro ao validar token de recuperação:', error);
+    res.status(500).json({ error: 'Falha ao validar link de recuperação.' });
+  }
+});
+
+apiRouter.post('/auth/reset-password', async (req, res) => {
+  try {
+    const rawToken = String(req.body?.token ?? '').trim();
+    const newPassword = String(req.body?.password ?? '');
+
+    if (!rawToken) {
+      return res.status(400).json({ error: 'Token de recuperação obrigatório.' });
+    }
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: 'A nova senha deve ter pelo menos 6 caracteres.' });
+    }
+
+    const tokenHash = hashResetToken(rawToken);
+    const rows = await db
+      .select()
+      .from(passwordResetTokens)
+      .where(eq(passwordResetTokens.tokenHash, tokenHash))
+      .limit(1);
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Link de recuperação inválido.' });
+    }
+
+    const record = rows[0];
+    if (record.usedAt) {
+      return res.status(410).json({ error: 'Este link de recuperação já foi utilizado.' });
+    }
+    if (record.expiresAt.getTime() < Date.now()) {
+      return res.status(410).json({ error: 'Este link de recuperação expirou.' });
+    }
+
+    const userRows = await db.select().from(users).where(eq(users.id, record.userId)).limit(1);
+    if (userRows.length === 0 || !userRows[0].active) {
+      return res.status(404).json({ error: 'Conta não encontrada ou inativa.' });
+    }
+    const user = userRows[0];
+
+    const passwordHash = await hashPassword(newPassword);
+    await db
+      .update(users)
+      .set({
+        passwordHash,
+        mustChangePassword: false,
+        active: true,
+      })
+      .where(eq(users.id, user.id));
+
+    await db
+      .update(passwordResetTokens)
+      .set({ usedAt: new Date() })
+      .where(and(eq(passwordResetTokens.userId, user.id), isNull(passwordResetTokens.usedAt)));
+
+    const linkedPlayers = await db
+      .select()
+      .from(players)
+      .where(eq(players.userId, user.id))
+      .limit(1);
+
+    const role = user.role === 'admin' ? 'admin' : 'player';
+    const sessionToken = signSessionToken({
+      userId: user.id,
+      uid: user.uid,
+      email: user.email,
+      role,
+    });
+
+    res.json({
+      token: sessionToken,
+      user: {
+        id: user.id,
+        uid: user.uid,
+        email: user.email,
+        name: user.name,
+        role,
+        playerId: linkedPlayers[0]?.id ?? null,
+      },
+      player: linkedPlayers[0] ?? null,
+    });
+  } catch (error) {
+    console.error('Erro ao redefinir senha:', error);
+    res.status(500).json({ error: 'Falha ao atualizar sua senha.' });
   }
 });
 
@@ -1182,6 +1502,20 @@ apiRouter.get('/admin/invites', requireAuth, requireAdmin, async (_req, res) => 
   } catch (error) {
     console.error('Erro ao listar e-mails de convite:', error);
     res.status(500).json({ error: 'Falha ao carregar caixa de convites enviados.' });
+  }
+});
+
+apiRouter.get('/admin/password-resets', requireAuth, requireAdmin, async (_req, res) => {
+  try {
+    const list = await db
+      .select()
+      .from(passwordResetEmails)
+      .orderBy(desc(passwordResetEmails.createdAt))
+      .limit(50);
+    res.json(list);
+  } catch (error) {
+    console.error('Erro ao listar solicitações de recuperação de senha:', error);
+    res.status(500).json({ error: 'Falha ao carregar e-mails de recuperação de senha.' });
   }
 });
 
@@ -2248,6 +2582,28 @@ apiRouter.get('/groups', requireAuth, async (req: AuthRequest, res) => {
         isOwner || myRoleEntry?.memberRole === 'admin' ? 'admin' : 'member';
       const isGroupAdmin = authUser.role === 'admin' || isOwner || myRoleEntry?.memberRole === 'admin';
 
+      let myAdminTitle: 'presidente' | 'tesoureiro' | 'presidente_tesoureiro' | 'administrador' | null =
+        null;
+      if (myRoleEntry?.memberRole === 'admin') {
+        if (myRoleEntry.adminTitle && VALID_ADMIN_TITLES.has(myRoleEntry.adminTitle)) {
+          myAdminTitle = myRoleEntry.adminTitle as
+            | 'presidente'
+            | 'tesoureiro'
+            | 'presidente_tesoureiro'
+            | 'administrador';
+        } else if (isOwner) {
+          myAdminTitle = 'presidente_tesoureiro';
+        } else {
+          myAdminTitle = 'administrador';
+        }
+      } else if (isOwner) {
+        myAdminTitle = 'presidente_tesoureiro';
+      } else if (authUser.role === 'admin') {
+        myAdminTitle = 'administrador';
+      }
+      const canConfirmPayments =
+        myAdminTitle !== null && FINANCIAL_CONFIRMER_TITLES.has(myAdminTitle);
+
       const gPeladas = allGroupPeladas.filter((p) => p.groupId === g.id);
       const openSeason = allGroupSeasons.find((s) => s.groupId === g.id && s.status === 'open');
       const jr = joinReqByGroup.get(g.id) ?? null;
@@ -2273,6 +2629,8 @@ apiRouter.get('/groups', requireAuth, async (req: AuthRequest, res) => {
         peladasCount: gPeladas.length,
         openSeasonName: openSeason?.name ?? null,
         myMemberRole,
+        myAdminTitle,
+        canConfirmPayments,
         isGroupAdmin,
         criteriaConfig: parseCriteriaConfig(g.criteriaConfig),
         membershipStatus,
@@ -2313,6 +2671,21 @@ apiRouter.get('/groups', requireAuth, async (req: AuthRequest, res) => {
   }
 });
 
+function parseNonNegativeFee(raw: unknown, fallback = 0): number {
+  if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
+  const normalized = typeof raw === 'string' ? raw.replace(',', '.').trim() : raw;
+  const num = Number(normalized);
+  if (!Number.isFinite(num) || num < 0) return fallback;
+  return Math.min(10000, Math.round(num * 100) / 100);
+}
+
+function formatBrl(value: number): string {
+  return new Intl.NumberFormat('pt-BR', {
+    style: 'currency',
+    currency: 'BRL',
+  }).format(value);
+}
+
 apiRouter.post('/groups', requireAuth, requireAdmin, async (req: AuthRequest, res) => {
   try {
     const authUser = req.authUser!;
@@ -2321,6 +2694,8 @@ apiRouter.post('/groups', requireAuth, requireAdmin, async (req: AuthRequest, re
     const weekday = String(req.body?.weekday ?? 'Quarta-feira').trim() || 'Quarta-feira';
     const startTime = String(req.body?.startTime ?? '20:00').trim() || '20:00';
     const location = String(req.body?.location ?? 'Quadra Principal').trim() || 'Quadra Principal';
+    const fullAddress = String(req.body?.fullAddress ?? '').trim().slice(0, 300) || null;
+    const avulsoFee = parseNonNegativeFee(req.body?.avulsoFee, 0);
     const playersPerTeam = Math.max(3, Math.min(7, Number(req.body?.playersPerTeam ?? 5)));
     const defaultTeamsCount = Math.max(2, Math.min(12, Math.round(Number(req.body?.defaultTeamsCount ?? 2))));
     const photoUrl = sanitizeImageUrl(req.body?.photoUrl);
@@ -2343,6 +2718,8 @@ apiRouter.post('/groups', requireAuth, requireAdmin, async (req: AuthRequest, re
         weekday,
         startTime,
         location,
+        fullAddress,
+        avulsoFee,
         playersPerTeam,
         defaultTeamsCount,
         photoUrl,
@@ -2357,6 +2734,7 @@ apiRouter.post('/groups', requireAuth, requireAdmin, async (req: AuthRequest, re
       userId: authUser.id,
       playerId: authUser.playerId,
       memberRole: 'admin',
+      adminTitle: 'presidente_tesoureiro',
     });
 
     if (memberPlayerIds.length > 0) {
@@ -2405,10 +2783,15 @@ apiRouter.post('/groups', requireAuth, requireAdmin, async (req: AuthRequest, re
   }
 });
 
-apiRouter.put('/groups/:id', requireAuth, requireAdmin, async (req, res) => {
+apiRouter.put('/groups/:id', requireAuth, async (req: AuthRequest, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) return res.status(400).json({ error: 'ID inválido.' });
+
+    const allowed = await isUserAdminOfGroup(req.authUser!, id);
+    if (!allowed) {
+      return res.status(403).json({ error: 'Apenas administradores desta pelada podem editar as informações.' });
+    }
 
     const existing = await db.select().from(peladaGroups).where(eq(peladaGroups.id, id)).limit(1);
     if (existing.length === 0) return res.status(404).json({ error: 'Pelada fixa não encontrada.' });
@@ -2416,6 +2799,16 @@ apiRouter.put('/groups/:id', requireAuth, requireAdmin, async (req, res) => {
 
     const name = String(req.body?.name ?? prev.name).trim();
     if (!name) return res.status(400).json({ error: 'Nome da pelada é obrigatório.' });
+
+    const nextFullAddress =
+      req.body?.fullAddress !== undefined
+        ? String(req.body.fullAddress ?? '').trim().slice(0, 300) || null
+        : prev.fullAddress;
+
+    const nextAvulsoFee =
+      req.body?.avulsoFee !== undefined
+        ? parseNonNegativeFee(req.body.avulsoFee, prev.avulsoFee ?? 0)
+        : prev.avulsoFee ?? 0;
 
     const updated = await db
       .update(peladaGroups)
@@ -2428,6 +2821,8 @@ apiRouter.put('/groups/:id', requireAuth, requireAdmin, async (req, res) => {
         weekday: req.body?.weekday ? String(req.body.weekday).trim() : prev.weekday,
         startTime: req.body?.startTime ? String(req.body.startTime).trim() : prev.startTime,
         location: req.body?.location ? String(req.body.location).trim() : prev.location,
+        fullAddress: nextFullAddress,
+        avulsoFee: nextAvulsoFee,
         playersPerTeam:
           req.body?.playersPerTeam !== undefined
             ? Math.max(3, Math.min(7, Number(req.body.playersPerTeam)))
@@ -2445,6 +2840,168 @@ apiRouter.put('/groups/:id', requireAuth, requireAdmin, async (req, res) => {
   } catch (error) {
     console.error('Erro ao atualizar pelada fixa:', error);
     res.status(500).json({ error: 'Falha ao atualizar pelada fixa.' });
+  }
+});
+
+apiRouter.get('/groups/:id/invites', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const groupId = Number(req.params.id);
+    if (!Number.isInteger(groupId) || groupId <= 0) {
+      return res.status(400).json({ error: 'ID inválido.' });
+    }
+    const allowed =
+      (await isUserAdminOfGroup(req.authUser!, groupId)) ||
+      (await hasActiveGroupAccess(req.authUser!, groupId));
+    if (!allowed) {
+      return res.status(403).json({ error: 'Apenas participantes cadastrados nesta pelada podem visualizar os convites.' });
+    }
+
+    const rows = await db
+      .select()
+      .from(inviteEmails)
+      .where(eq(inviteEmails.groupId, groupId))
+      .orderBy(desc(inviteEmails.createdAt))
+      .limit(25);
+    res.json(rows);
+  } catch (error) {
+    console.error('Erro ao listar convites da pelada:', error);
+    res.status(500).json({ error: 'Falha ao carregar convites enviados.' });
+  }
+});
+
+apiRouter.post('/groups/:id/invite-player', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const groupId = Number(req.params.id);
+    if (!Number.isInteger(groupId) || groupId <= 0) {
+      return res.status(400).json({ error: 'ID da pelada inválido.' });
+    }
+
+    const authUser = req.authUser!;
+    const allowed =
+      (await isUserAdminOfGroup(authUser, groupId)) ||
+      (await hasActiveGroupAccess(authUser, groupId));
+    if (!allowed) {
+      return res.status(403).json({
+        error: 'Apenas administradores ou peladeiros já cadastrados nesta pelada podem enviar convites.',
+      });
+    }
+
+    const groupRows = await db
+      .select()
+      .from(peladaGroups)
+      .where(eq(peladaGroups.id, groupId))
+      .limit(1);
+    if (groupRows.length === 0) {
+      return res.status(404).json({ error: 'Pelada fixa não encontrada.' });
+    }
+    const group = groupRows[0];
+
+    const email = String(req.body?.email ?? '').trim().toLowerCase();
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 180) {
+      return res.status(400).json({ error: 'Informe um e-mail válido para convidar o peladeiro.' });
+    }
+
+    const rawFee = req.body?.avulsoFee;
+    if (rawFee !== undefined && rawFee !== null && String(rawFee).trim() !== '') {
+      const normalized = typeof rawFee === 'string' ? rawFee.replace(',', '.').trim() : rawFee;
+      const num = Number(normalized);
+      if (!Number.isFinite(num) || num < 0 || num > 10000) {
+        return res.status(400).json({ error: 'Informe um valor de avulso válido (R$ 0,00 ou maior).' });
+      }
+    }
+    const avulsoFee = parseNonNegativeFee(rawFee, group.avulsoFee ?? 0);
+
+    const existingUserRows = await db.select().from(users).where(eq(users.email, email)).limit(1);
+    const baseUrl = getBaseAppUrl(req);
+    let targetUserId: number;
+    let inviteLink = baseUrl;
+
+    if (existingUserRows.length > 0) {
+      const existingUser = existingUserRows[0];
+      targetUserId = existingUser.id;
+      if (!existingUser.passwordHash) {
+        const inviteToken = generateInviteToken();
+        const inviteExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+        await db
+          .update(users)
+          .set({ inviteToken, inviteExpiresAt, active: true })
+          .where(eq(users.id, existingUser.id));
+        inviteLink = `${baseUrl}/?convite=${encodeURIComponent(inviteToken)}`;
+      }
+    } else {
+      const inviteToken = generateInviteToken();
+      const inviteExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+      const fallbackName = email.split('@')[0].slice(0, 60) || 'Convidado';
+      const insertedUser = await db
+        .insert(users)
+        .values({
+          uid: `local:${crypto.randomUUID()}`,
+          email,
+          name: fallbackName,
+          role: 'player',
+          inviteToken,
+          inviteExpiresAt,
+          active: true,
+        })
+        .returning();
+      targetUserId = insertedUser[0].id;
+      inviteLink = `${baseUrl}/?convite=${encodeURIComponent(inviteToken)}`;
+    }
+
+    const linkedPlayerRows = await db
+      .select({ id: players.id })
+      .from(players)
+      .where(eq(players.userId, targetUserId))
+      .limit(1);
+    const linkedPlayerId = linkedPlayerRows[0]?.id ?? null;
+
+    const fullAddressText = group.fullAddress?.trim()
+      ? `${group.location} — ${group.fullAddress.trim()}`
+      : group.location;
+    const feeFormatted = avulsoFee > 0 ? formatBrl(avulsoFee) : 'Gratuito (R$ 0,00)';
+
+    const subject = `Convite para a Pelada: ${group.name} (${group.weekday} às ${group.startTime})`;
+    const bodyText = [
+      `Olá!`,
+      ``,
+      `${authUser.name} convidou você para participar da pelada "${group.name}" no QuadraMestre!`,
+      ``,
+      `Detalhes da Pelada:`,
+      `- Nome da pelada: ${group.name}`,
+      `- Dia: ${group.weekday}`,
+      `- Horário: ${group.startTime}`,
+      `- Endereço completo: ${fullAddressText}`,
+      `- Valor do avulso: ${feeFormatted}`,
+      ``,
+      `Para confirmar sua presença ou concluir seu cadastro, acesse:`,
+      `${inviteLink}`,
+      ``,
+      `Nos vemos na quadra!`,
+    ].join('\n');
+
+    const insertedInvite = await db
+      .insert(inviteEmails)
+      .values({
+        userId: targetUserId,
+        playerId: linkedPlayerId,
+        groupId: group.id,
+        invitedByUserId: authUser.id,
+        avulsoFee,
+        toEmail: email,
+        subject,
+        bodyText,
+        inviteLink,
+        status: 'sent',
+      })
+      .returning();
+
+    res.status(201).json({
+      invite: insertedInvite[0],
+      avulsoFee,
+    });
+  } catch (error) {
+    console.error('Erro ao gerar convite de peladeiro:', error);
+    res.status(500).json({ error: 'Falha ao criar e-mail de convite da pelada.' });
   }
 });
 
@@ -2472,6 +3029,7 @@ apiRouter.get('/groups/:id/members', requireAuth, async (req, res) => {
         userId: peladaGroupMembers.userId,
         playerId: peladaGroupMembers.playerId,
         memberRole: peladaGroupMembers.memberRole,
+        adminTitle: peladaGroupMembers.adminTitle,
         playerCategory: peladaGroupMembers.playerCategory,
         accessPeladaId: peladaGroupMembers.accessPeladaId,
         accessExpiresAt: peladaGroupMembers.accessExpiresAt,
@@ -2496,10 +3054,15 @@ apiRouter.get('/groups/:id/members', requireAuth, async (req, res) => {
   }
 });
 
-apiRouter.post('/groups/:id/members', requireAuth, requireAdmin, async (req, res) => {
+apiRouter.post('/groups/:id/members', requireAuth, async (req: AuthRequest, res) => {
   try {
     const groupId = Number(req.params.id);
     if (!Number.isInteger(groupId)) return res.status(400).json({ error: 'ID inválido.' });
+
+    const allowed = await isUserAdminOfGroup(req.authUser!, groupId);
+    if (!allowed) {
+      return res.status(403).json({ error: 'Apenas administradores da pelada podem gerenciar membros.' });
+    }
 
     const playerId = req.body?.playerId ? Number(req.body.playerId) : null;
     let userId = req.body?.userId ? Number(req.body.userId) : null;
@@ -2686,6 +3249,14 @@ apiRouter.patch('/groups/:id/members/:memberId', requireAuth, async (req: AuthRe
         : req.body?.memberRole === 'member'
           ? 'member'
           : prev.memberRole;
+    const nextAdminTitle =
+      nextRole !== 'admin'
+        ? null
+        : req.body?.adminTitle !== undefined
+          ? VALID_ADMIN_TITLES.has(String(req.body.adminTitle))
+            ? String(req.body.adminTitle)
+            : 'administrador'
+          : prev.adminTitle ?? 'administrador';
     const nextCategory =
       req.body?.playerCategory && VALID_CATEGORIES.has(req.body.playerCategory)
         ? String(req.body.playerCategory)
@@ -2693,7 +3264,11 @@ apiRouter.patch('/groups/:id/members/:memberId', requireAuth, async (req: AuthRe
 
     const updated = await db
       .update(peladaGroupMembers)
-      .set({ memberRole: nextRole, playerCategory: nextCategory })
+      .set({
+        memberRole: nextRole,
+        adminTitle: nextAdminTitle,
+        playerCategory: nextCategory,
+      })
       .where(eq(peladaGroupMembers.id, memberId))
       .returning();
 
@@ -2731,12 +3306,16 @@ apiRouter.patch('/groups/:id/members/:memberId', requireAuth, async (req: AuthRe
   }
 });
 
-apiRouter.delete('/groups/:id/members/:memberId', requireAuth, requireAdmin, async (req, res) => {
+apiRouter.delete('/groups/:id/members/:memberId', requireAuth, async (req: AuthRequest, res) => {
   try {
     const groupId = Number(req.params.id);
     const memberId = Number(req.params.memberId);
     if (!Number.isInteger(groupId) || !Number.isInteger(memberId)) {
       return res.status(400).json({ error: 'Parâmetros inválidos.' });
+    }
+    const allowed = await isUserAdminOfGroup(req.authUser!, groupId);
+    if (!allowed) {
+      return res.status(403).json({ error: 'Apenas administradores da pelada podem remover membros.' });
     }
     await db
       .delete(peladaGroupMembers)
@@ -3391,9 +3970,14 @@ apiRouter.get('/seasons', requireAuth, async (req, res) => {
   }
 });
 
-apiRouter.post('/seasons', requireAuth, requireAdmin, async (req: AuthRequest, res) => {
+apiRouter.post('/seasons', requireAuth, async (req: AuthRequest, res) => {
   try {
     const groupId = req.body?.groupId ? Number(req.body.groupId) : null;
+    const allowed = await isUserAdminOfGroup(req.authUser!, groupId);
+    if (!allowed) {
+      return res.status(403).json({ error: 'Apenas administradores da pelada podem abrir temporadas.' });
+    }
+
     const name = String(req.body?.name ?? '').trim();
     const description = String(req.body?.description ?? '').trim() || null;
     const startDate = String(req.body?.startDate ?? new Date().toISOString().slice(0, 10));
@@ -3421,10 +4005,18 @@ apiRouter.post('/seasons', requireAuth, requireAdmin, async (req: AuthRequest, r
   }
 });
 
-apiRouter.post('/seasons/:id/close', requireAuth, requireAdmin, async (req, res) => {
+apiRouter.post('/seasons/:id/close', requireAuth, async (req: AuthRequest, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) return res.status(400).json({ error: 'ID inválido.' });
+
+    const seasonRow = await db.select().from(seasons).where(eq(seasons.id, id)).limit(1);
+    if (seasonRow.length === 0) return res.status(404).json({ error: 'Temporada não encontrada.' });
+
+    const allowed = await isUserAdminOfGroup(req.authUser!, seasonRow[0].groupId);
+    if (!allowed) {
+      return res.status(403).json({ error: 'Apenas administradores da pelada podem fechar temporadas.' });
+    }
 
     const stats = await computeSeasonStats(id);
     if (!stats) return res.status(404).json({ error: 'Temporada não encontrada.' });
@@ -3461,10 +4053,18 @@ apiRouter.post('/seasons/:id/close', requireAuth, requireAdmin, async (req, res)
   }
 });
 
-apiRouter.post('/seasons/:id/reopen', requireAuth, requireAdmin, async (req, res) => {
+apiRouter.post('/seasons/:id/reopen', requireAuth, async (req: AuthRequest, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) return res.status(400).json({ error: 'ID inválido.' });
+
+    const seasonRow = await db.select().from(seasons).where(eq(seasons.id, id)).limit(1);
+    if (seasonRow.length === 0) return res.status(404).json({ error: 'Temporada não encontrada.' });
+
+    const allowed = await isUserAdminOfGroup(req.authUser!, seasonRow[0].groupId);
+    if (!allowed) {
+      return res.status(403).json({ error: 'Apenas administradores da pelada podem reabrir temporadas.' });
+    }
 
     const updated = await db
       .update(seasons)
@@ -3553,7 +4153,7 @@ apiRouter.get('/peladas', requireAuth, async (req, res) => {
   }
 });
 
-apiRouter.post('/peladas', requireAuth, requireAdmin, async (req: AuthRequest, res) => {
+apiRouter.post('/peladas', requireAuth, async (req: AuthRequest, res) => {
   try {
     const seasonId = Number(req.body?.seasonId);
     const reqGroupId = req.body?.groupId ? Number(req.body.groupId) : null;
@@ -3584,6 +4184,10 @@ apiRouter.post('/peladas', requireAuth, requireAdmin, async (req: AuthRequest, r
 
     const resolvedGroupId =
       reqGroupId && Number.isInteger(reqGroupId) ? reqGroupId : seasonRow[0].groupId ?? null;
+    const allowed = await isUserAdminOfGroup(req.authUser!, resolvedGroupId);
+    if (!allowed) {
+      return res.status(403).json({ error: 'Apenas administradores da pelada podem cadastrar encontros.' });
+    }
 
     const inserted = await db
       .insert(peladas)
@@ -3709,19 +4313,47 @@ apiRouter.get('/peladas/:id', requireAuth, async (req: AuthRequest, res) => {
   }
 });
 
-apiRouter.patch('/peladas/:id/status', requireAuth, requireAdmin, async (req, res) => {
+apiRouter.patch('/peladas/:id/status', requireAuth, async (req: AuthRequest, res) => {
   try {
     const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ error: 'ID inválido.' });
+    }
     const status = String(req.body?.status ?? '');
     if (!['scheduled', 'in_progress', 'finished'].includes(status)) {
       return res.status(400).json({ error: 'Status inválido.' });
     }
+
+    const existingPelada = await db.select().from(peladas).where(eq(peladas.id, id)).limit(1);
+    if (existingPelada.length === 0) {
+      return res.status(404).json({ error: 'Pelada não encontrada.' });
+    }
+    const pelada = existingPelada[0];
+    const allowed = await isUserAdminOfGroup(req.authUser!, pelada.groupId);
+    if (!allowed) {
+      return res.status(403).json({ error: 'Apenas administradores podem alterar o status da pelada.' });
+    }
+
     const updated = await db
       .update(peladas)
       .set({ status })
       .where(eq(peladas.id, id))
       .returning();
-    res.json(updated[0]);
+
+    let financeResult = null;
+    if (status === 'finished' && pelada.groupId) {
+      financeResult = await ensurePeladaChargesAndSendPixEmails({
+        groupId: pelada.groupId,
+        peladaId: id,
+        createMissingForPelada: true,
+        sendEmails: true,
+      });
+    }
+
+    res.json({
+      ...updated[0],
+      financeNotification: financeResult,
+    });
   } catch (error) {
     console.error('Erro ao atualizar status da pelada:', error);
     res.status(500).json({ error: 'Falha ao atualizar status.' });
@@ -3795,7 +4427,7 @@ apiRouter.post('/peladas/:id/rsvp', requireAuth, async (req: AuthRequest, res) =
   }
 });
 
-apiRouter.post('/peladas/:id/attendance', requireAuth, requireAdmin, async (req, res) => {
+apiRouter.post('/peladas/:id/attendance', requireAuth, async (req: AuthRequest, res) => {
   try {
     const peladaId = Number(req.params.id);
     const playerId = Number(req.body?.playerId);
@@ -3809,9 +4441,15 @@ apiRouter.post('/peladas/:id/attendance', requireAuth, requireAdmin, async (req,
       return res.status(400).json({ error: 'Parâmetros inválidos.' });
     }
 
+    const pelRow = await db.select().from(peladas).where(eq(peladas.id, peladaId)).limit(1);
+    if (pelRow.length === 0) return res.status(404).json({ error: 'Pelada não encontrada.' });
+    const allowed = await isUserAdminOfGroup(req.authUser!, pelRow[0].groupId);
+    if (!allowed) {
+      return res.status(403).json({ error: 'Apenas administradores podem gerenciar presenças.' });
+    }
+
     if (present) {
-      const pelRow = await db.select().from(peladas).where(eq(peladas.id, peladaId)).limit(1);
-      if (pelRow[0]?.groupId) {
+      if (pelRow[0].groupId) {
         await db
           .update(peladaGroupMembers)
           .set({
@@ -3861,9 +4499,17 @@ apiRouter.post('/peladas/:id/attendance', requireAuth, requireAdmin, async (req,
   }
 });
 
-apiRouter.post('/peladas/:id/teams', requireAuth, requireAdmin, async (req, res) => {
+apiRouter.post('/peladas/:id/teams', requireAuth, async (req: AuthRequest, res) => {
   try {
     const peladaId = Number(req.params.id);
+    if (!Number.isInteger(peladaId)) return res.status(400).json({ error: 'ID inválido.' });
+    const pelRow = await db.select({ groupId: peladas.groupId }).from(peladas).where(eq(peladas.id, peladaId)).limit(1);
+    if (pelRow.length === 0) return res.status(404).json({ error: 'Pelada não encontrada.' });
+    const allowed = await isUserAdminOfGroup(req.authUser!, pelRow[0].groupId);
+    if (!allowed) {
+      return res.status(403).json({ error: 'Apenas administradores podem criar times.' });
+    }
+
     const name = String(req.body?.name ?? '').trim();
     const colorHex = String(req.body?.colorHex ?? '#059669').trim();
     if (!name) return res.status(400).json({ error: 'Informe o nome do time.' });
@@ -3879,10 +4525,20 @@ apiRouter.post('/peladas/:id/teams', requireAuth, requireAdmin, async (req, res)
   }
 });
 
-apiRouter.delete('/peladas/:id/teams/:teamId', requireAuth, requireAdmin, async (req, res) => {
+apiRouter.delete('/peladas/:id/teams/:teamId', requireAuth, async (req: AuthRequest, res) => {
   try {
     const peladaId = Number(req.params.id);
     const teamId = Number(req.params.teamId);
+    if (!Number.isInteger(peladaId) || !Number.isInteger(teamId)) {
+      return res.status(400).json({ error: 'ID inválido.' });
+    }
+    const pelRow = await db.select({ groupId: peladas.groupId }).from(peladas).where(eq(peladas.id, peladaId)).limit(1);
+    if (pelRow.length === 0) return res.status(404).json({ error: 'Pelada não encontrada.' });
+    const allowed = await isUserAdminOfGroup(req.authUser!, pelRow[0].groupId);
+    if (!allowed) {
+      return res.status(403).json({ error: 'Apenas administradores podem remover times.' });
+    }
+
     const usedInMatch = await db
       .select({ id: matches.id })
       .from(matches)
@@ -3915,9 +4571,16 @@ apiRouter.delete('/peladas/:id/teams/:teamId', requireAuth, requireAdmin, async 
   }
 });
 
-apiRouter.post('/peladas/:id/teams/auto-balance', requireAuth, requireAdmin, async (req, res) => {
+apiRouter.post('/peladas/:id/teams/auto-balance', requireAuth, async (req: AuthRequest, res) => {
   try {
     const peladaId = Number(req.params.id);
+    if (!Number.isInteger(peladaId)) return res.status(400).json({ error: 'ID inválido.' });
+    const pelRow = await db.select({ groupId: peladas.groupId }).from(peladas).where(eq(peladas.id, peladaId)).limit(1);
+    if (pelRow.length === 0) return res.status(404).json({ error: 'Pelada não encontrada.' });
+    const allowed = await isUserAdminOfGroup(req.authUser!, pelRow[0].groupId);
+    if (!allowed) {
+      return res.status(403).json({ error: 'Apenas administradores podem sortear times.' });
+    }
     const existingTeams = await db
       .select()
       .from(peladaTeams)
@@ -3984,7 +4647,7 @@ apiRouter.post('/peladas/:id/teams/auto-balance', requireAuth, requireAdmin, asy
 // MATCHES & EVENTS (GOLS, ASSISTÊNCIAS, DEFESAS)
 // ==========================================
 
-apiRouter.post('/peladas/:id/matches', requireAuth, requireAdmin, async (req, res) => {
+apiRouter.post('/peladas/:id/matches', requireAuth, async (req: AuthRequest, res) => {
   try {
     const peladaId = Number(req.params.id);
     const teamAId = Number(req.body?.teamAId);
@@ -3997,6 +4660,10 @@ apiRouter.post('/peladas/:id/matches', requireAuth, requireAdmin, async (req, re
 
     const peladaRows = await db.select().from(peladas).where(eq(peladas.id, peladaId)).limit(1);
     if (peladaRows.length === 0) return res.status(404).json({ error: 'Pelada não encontrada.' });
+    const allowed = await isUserAdminOfGroup(req.authUser!, peladaRows[0].groupId);
+    if (!allowed) {
+      return res.status(403).json({ error: 'Apenas administradores podem iniciar partidas.' });
+    }
 
     const existingMatches = await db
       .select({ matchNumber: matches.matchNumber })
@@ -4058,7 +4725,7 @@ async function syncMatchScoreFromEvents(matchId: number) {
   return updated[0];
 }
 
-apiRouter.post('/matches/:id/events', requireAuth, requireAdmin, async (req, res) => {
+apiRouter.post('/matches/:id/events', requireAuth, async (req: AuthRequest, res) => {
   try {
     const matchId = Number(req.params.id);
     const eventType = String(req.body?.eventType ?? '');
@@ -4080,6 +4747,12 @@ apiRouter.post('/matches/:id/events', requireAuth, requireAdmin, async (req, res
     const matchRows = await db.select().from(matches).where(eq(matches.id, matchId)).limit(1);
     if (matchRows.length === 0) return res.status(404).json({ error: 'Partida não encontrada.' });
     const m = matchRows[0];
+
+    const pelRow = await db.select({ groupId: peladas.groupId }).from(peladas).where(eq(peladas.id, m.peladaId)).limit(1);
+    const allowed = await isUserAdminOfGroup(req.authUser!, pelRow[0]?.groupId);
+    if (!allowed) {
+      return res.status(403).json({ error: 'Apenas administradores podem registrar lances na partida.' });
+    }
 
     const inserted = await db
       .insert(matchEvents)
@@ -4103,7 +4776,7 @@ apiRouter.post('/matches/:id/events', requireAuth, requireAdmin, async (req, res
   }
 });
 
-apiRouter.delete('/match-events/:eventId', requireAuth, requireAdmin, async (req, res) => {
+apiRouter.delete('/match-events/:eventId', requireAuth, async (req: AuthRequest, res) => {
   try {
     const eventId = Number(req.params.eventId);
     const rows = await db
@@ -4112,6 +4785,12 @@ apiRouter.delete('/match-events/:eventId', requireAuth, requireAdmin, async (req
       .where(eq(matchEvents.id, eventId))
       .limit(1);
     if (rows.length === 0) return res.status(404).json({ error: 'Lance não encontrado.' });
+
+    const pelRow = await db.select({ groupId: peladas.groupId }).from(peladas).where(eq(peladas.id, rows[0].peladaId)).limit(1);
+    const allowed = await isUserAdminOfGroup(req.authUser!, pelRow[0]?.groupId);
+    if (!allowed) {
+      return res.status(403).json({ error: 'Apenas administradores podem remover lances da partida.' });
+    }
 
     const matchId = rows[0].matchId;
     await db.delete(matchEvents).where(eq(matchEvents.id, eventId));
@@ -4123,11 +4802,17 @@ apiRouter.delete('/match-events/:eventId', requireAuth, requireAdmin, async (req
   }
 });
 
-apiRouter.post('/matches/:id/finish', requireAuth, requireAdmin, async (req, res) => {
+apiRouter.post('/matches/:id/finish', requireAuth, async (req: AuthRequest, res) => {
   try {
     const matchId = Number(req.params.id);
     const matchRows = await db.select().from(matches).where(eq(matches.id, matchId)).limit(1);
     if (matchRows.length === 0) return res.status(404).json({ error: 'Partida não encontrada.' });
+
+    const pelRow = await db.select({ groupId: peladas.groupId }).from(peladas).where(eq(peladas.id, matchRows[0].peladaId)).limit(1);
+    const allowed = await isUserAdminOfGroup(req.authUser!, pelRow[0]?.groupId);
+    if (!allowed) {
+      return res.status(403).json({ error: 'Apenas administradores podem finalizar partidas.' });
+    }
 
     const updated = await db
       .update(matches)
@@ -4143,11 +4828,17 @@ apiRouter.post('/matches/:id/finish', requireAuth, requireAdmin, async (req, res
   }
 });
 
-apiRouter.post('/matches/:id/reopen', requireAuth, requireAdmin, async (req, res) => {
+apiRouter.post('/matches/:id/reopen', requireAuth, async (req: AuthRequest, res) => {
   try {
     const matchId = Number(req.params.id);
     const matchRows = await db.select().from(matches).where(eq(matches.id, matchId)).limit(1);
     if (matchRows.length === 0) return res.status(404).json({ error: 'Partida não encontrada.' });
+
+    const pelRow = await db.select({ groupId: peladas.groupId }).from(peladas).where(eq(peladas.id, matchRows[0].peladaId)).limit(1);
+    const allowed = await isUserAdminOfGroup(req.authUser!, pelRow[0]?.groupId);
+    if (!allowed) {
+      return res.status(403).json({ error: 'Apenas administradores podem reabrir partidas.' });
+    }
 
     const updated = await db
       .update(matches)
@@ -4219,30 +4910,30 @@ apiRouter.post('/matches/:id/evaluations', requireAuth, async (req: AuthRequest,
     const criteriaConfig = await getGroupCriteriaConfig(groupId);
     const rawScores = req.body?.scores && typeof req.body.scores === 'object' ? req.body.scores : {};
 
-    const physical = clampIntScore(rawScores.physical ?? req.body?.physical, 7);
-    const dribbling = clampIntScore(rawScores.dribbling ?? req.body?.dribbling, 7);
-    const shooting = clampIntScore(rawScores.shooting ?? req.body?.shooting, 7);
-    const defense = clampIntScore(rawScores.defense ?? req.body?.defense, 7);
-    const attack = clampIntScore(rawScores.attack ?? req.body?.attack, 7);
-    const passing = clampIntScore(rawScores.passing ?? req.body?.passing, 7);
-    const positioning = clampIntScore(rawScores.positioning ?? req.body?.positioning, 7);
-
     const scoresMap: Record<string, number> = {
-      physical,
-      dribbling,
-      shooting,
-      defense,
-      attack,
-      passing,
-      positioning,
+      physical: clampHalfStepScore(rawScores.physical ?? req.body?.physical, 7),
+      dribbling: clampHalfStepScore(rawScores.dribbling ?? req.body?.dribbling, 7),
+      shooting: clampHalfStepScore(rawScores.shooting ?? req.body?.shooting, 7),
+      defense: clampHalfStepScore(rawScores.defense ?? req.body?.defense, 7),
+      attack: clampHalfStepScore(rawScores.attack ?? req.body?.attack, 7),
+      passing: clampHalfStepScore(rawScores.passing ?? req.body?.passing, 7),
+      positioning: clampHalfStepScore(rawScores.positioning ?? req.body?.positioning, 7),
     };
     for (const c of criteriaConfig) {
       if (rawScores[c.key] !== undefined) {
-        scoresMap[c.key] = clampIntScore(rawScores[c.key], 7);
+        scoresMap[c.key] = clampHalfStepScore(rawScores[c.key], 7);
       } else if (scoresMap[c.key] === undefined) {
         scoresMap[c.key] = 7;
       }
     }
+
+    const physical = clampIntScore(scoresMap.physical, 7);
+    const dribbling = clampIntScore(scoresMap.dribbling, 7);
+    const shooting = clampIntScore(scoresMap.shooting, 7);
+    const defense = clampIntScore(scoresMap.defense, 7);
+    const attack = clampIntScore(scoresMap.attack, 7);
+    const passing = clampIntScore(scoresMap.passing, 7);
+    const positioning = clampIntScore(scoresMap.positioning, 7);
 
     const averageScore = computeWeightedOverall(scoresMap, criteriaConfig);
     const scoresJson = JSON.stringify(scoresMap);
@@ -4294,3 +4985,1040 @@ apiRouter.post('/matches/:id/evaluations', requireAuth, async (req: AuthRequest,
     res.status(500).json({ error: 'Falha ao registrar avaliação do jogador.' });
   }
 });
+
+// ==========================================
+// CONTROLE FINANCEIRO DA PELADA & COBRANÇA PIX
+// ==========================================
+
+const VALID_FINANCE_ENTRY_TYPES = new Set(['cash_box', 'income', 'expense', 'pending_debt']);
+
+function formatMonthYearRef(dateStr: string): string {
+  const m = /^(\d{4})-(\d{2})/.exec(dateStr);
+  if (m) return `${m[2]}/${m[1]}`;
+  const now = new Date();
+  return `${String(now.getUTCMonth() + 1).padStart(2, '0')}/${now.getUTCFullYear()}`;
+}
+
+async function ensurePeladaChargesAndSendPixEmails(params: {
+  groupId: number;
+  peladaId?: number | null;
+  createMissingForPelada?: boolean;
+  sendEmails?: boolean;
+}) {
+  const { groupId, peladaId = null, createMissingForPelada = false, sendEmails = true } = params;
+
+  const groupRows = await db
+    .select()
+    .from(peladaGroups)
+    .where(eq(peladaGroups.id, groupId))
+    .limit(1);
+  if (groupRows.length === 0) {
+    return {
+      chargesCreated: 0,
+      emailsSent: 0,
+      skippedNoPix: false,
+      skippedNoEmail: [] as string[],
+      emails: [] as Array<typeof peladaPixPaymentEmails.$inferSelect>,
+    };
+  }
+  const group = groupRows[0];
+
+  let targetPelada: typeof peladas.$inferSelect | null = null;
+  if (peladaId && Number.isInteger(peladaId)) {
+    const pRows = await db
+      .select()
+      .from(peladas)
+      .where(and(eq(peladas.id, peladaId), eq(peladas.groupId, groupId)))
+      .limit(1);
+    targetPelada = pRows[0] ?? null;
+  }
+
+  let chargesCreated = 0;
+  let presentPlayerIds: number[] | null = null;
+
+  if (targetPelada) {
+    const attRows = await db
+      .select({ playerId: peladaAttendances.playerId })
+      .from(peladaAttendances)
+      .where(and(eq(peladaAttendances.peladaId, targetPelada.id), eq(peladaAttendances.present, true)));
+    presentPlayerIds = attRows.map((a) => a.playerId);
+
+    if (createMissingForPelada && presentPlayerIds.length > 0) {
+      const memberRows = await db
+        .select()
+        .from(peladaGroupMembers)
+        .where(eq(peladaGroupMembers.groupId, groupId));
+      const playerRows = await db
+        .select()
+        .from(players)
+        .where(inArray(players.id, presentPlayerIds));
+      const existingPayments = await db
+        .select()
+        .from(peladaParticipantPayments)
+        .where(eq(peladaParticipantPayments.groupId, groupId));
+
+      const monthRef = formatMonthYearRef(targetPelada.eventDate);
+      const sessionRef = `${targetPelada.title} (${targetPelada.eventDate})`;
+
+      for (const p of playerRows) {
+        const mem = memberRows.find(
+          (m) => m.playerId === p.id || (p.userId != null && m.userId === p.userId)
+        );
+        const cat = mem?.playerCategory ?? p.category ?? 'mensalista';
+        const isMensalista = cat === 'mensalista';
+
+        if (isMensalista && (group.monthlyFee ?? 0) > 0) {
+          const alreadyHasMonthly = existingPayments.some(
+            (pay) =>
+              pay.playerId === p.id &&
+              pay.paymentType === 'mensalidade' &&
+              pay.referenceLabel === monthRef
+          );
+          if (!alreadyHasMonthly) {
+            await db.insert(peladaParticipantPayments).values({
+              groupId,
+              peladaId: targetPelada.id,
+              playerId: p.id,
+              userId: p.userId ?? mem?.userId ?? null,
+              paymentType: 'mensalidade',
+              referenceLabel: monthRef,
+              amount: group.monthlyFee,
+              status: 'pending',
+              notes: `Mensalidade referente a ${monthRef}`,
+            });
+            chargesCreated++;
+          }
+        } else if ((group.avulsoFee ?? 0) > 0) {
+          const alreadyHasDiaria = existingPayments.some(
+            (pay) =>
+              pay.playerId === p.id &&
+              pay.paymentType === 'diaria' &&
+              pay.peladaId === targetPelada!.id
+          );
+          if (!alreadyHasDiaria) {
+            await db.insert(peladaParticipantPayments).values({
+              groupId,
+              peladaId: targetPelada.id,
+              playerId: p.id,
+              userId: p.userId ?? mem?.userId ?? null,
+              paymentType: 'diaria',
+              referenceLabel: sessionRef,
+              amount: group.avulsoFee,
+              status: 'pending',
+              notes: `Diária do encontro ${sessionRef}`,
+            });
+            chargesCreated++;
+          }
+        }
+      }
+    }
+  }
+
+  const pixKey = group.pixKey?.trim() ?? '';
+  if (!sendEmails) {
+    return {
+      chargesCreated,
+      emailsSent: 0,
+      skippedNoPix: !pixKey,
+      skippedNoEmail: [],
+      emails: [],
+    };
+  }
+
+  if (!pixKey) {
+    return {
+      chargesCreated,
+      emailsSent: 0,
+      skippedNoPix: true,
+      skippedNoEmail: [],
+      emails: [],
+    };
+  }
+
+  const pendingPayments = await db
+    .select()
+    .from(peladaParticipantPayments)
+    .where(
+      and(
+        eq(peladaParticipantPayments.groupId, groupId),
+        eq(peladaParticipantPayments.status, 'pending')
+      )
+    );
+
+  // If finishing a specific pelada with present players, prioritize those pending payments
+  // (either matching this peladaId or unpaid mensalidades of present players)
+  const scopedPending = pendingPayments.filter((pay) => {
+    if (pay.amount <= 0) return false;
+    if (targetPelada) {
+      if (pay.peladaId === targetPelada.id) return true;
+      if (presentPlayerIds && presentPlayerIds.includes(pay.playerId)) return true;
+      return false;
+    }
+    return true;
+  });
+
+  if (scopedPending.length === 0) {
+    return {
+      chargesCreated,
+      emailsSent: 0,
+      skippedNoPix: false,
+      skippedNoEmail: [],
+      emails: [],
+    };
+  }
+
+  const pIds = Array.from(new Set(scopedPending.map((p) => p.playerId)));
+  const pRows = await db.select().from(players).where(inArray(players.id, pIds));
+  const playerMap = new Map(pRows.map((p) => [p.id, p]));
+
+  const uIds = Array.from(
+    new Set(
+      [...scopedPending.map((p) => p.userId), ...pRows.map((p) => p.userId)].filter(
+        (id): id is number => id != null
+      )
+    )
+  );
+  const uRows =
+    uIds.length > 0
+      ? await db
+          .select({ id: users.id, email: users.email })
+          .from(users)
+          .where(inArray(users.id, uIds))
+      : [];
+  const userEmailMap = new Map(uRows.map((u) => [u.id, u.email]));
+
+  const sentEmails: Array<typeof peladaPixPaymentEmails.$inferSelect> = [];
+  const skippedNoEmail: string[] = [];
+
+  for (const pay of scopedPending) {
+    const player = playerMap.get(pay.playerId);
+    if (!player) continue;
+    const toEmail =
+      player.email?.trim() ||
+      (pay.userId ? userEmailMap.get(pay.userId) : undefined) ||
+      (player.userId ? userEmailMap.get(player.userId) : undefined) ||
+      '';
+
+    if (!toEmail || !toEmail.includes('@')) {
+      skippedNoEmail.push(player.nickname || player.name);
+      continue;
+    }
+
+    const tipoLabel = pay.paymentType === 'mensalidade' ? 'Mensalidade' : 'Diária';
+    const valorFormatado = formatBrl(pay.amount);
+    const encontroInfo = targetPelada
+      ? `${targetPelada.title} (${targetPelada.eventDate})`
+      : pay.referenceLabel;
+
+    const subject = `Pagamento pendente (${tipoLabel}) — ${group.name} · ${valorFormatado}`;
+    const bodyText = [
+      `Olá ${player.nickname} (${player.name})!`,
+      ``,
+      `Identificamos um pagamento pendente referente à pelada "${group.name}".`,
+      ``,
+      `Detalhes da cobrança:`,
+      `- Tipo: ${tipoLabel}`,
+      `- Referência: ${encontroInfo}`,
+      `- Valor para pagamento: ${valorFormatado}`,
+      `- Chave PIX para pagamento: ${pixKey}`,
+      ``,
+      `Após realizar a transferência via PIX, o Presidente ou Tesoureiro da pelada confirmará o recebimento no controle financeiro do QuadraMestre.`,
+      ``,
+      `Obrigado e até o próximo jogo!`,
+    ].join('\n');
+
+    const inserted = await db
+      .insert(peladaPixPaymentEmails)
+      .values({
+        groupId,
+        peladaId: targetPelada?.id ?? pay.peladaId ?? null,
+        paymentId: pay.id,
+        userId: pay.userId ?? player.userId ?? null,
+        playerId: player.id,
+        toEmail,
+        subject,
+        bodyText,
+        pixKey,
+        amount: pay.amount,
+        status: 'sent',
+      })
+      .returning();
+
+    sentEmails.push(inserted[0]);
+
+    await db
+      .update(peladaParticipantPayments)
+      .set({ pixEmailSentAt: new Date() })
+      .where(eq(peladaParticipantPayments.id, pay.id));
+  }
+
+  return {
+    chargesCreated,
+    emailsSent: sentEmails.length,
+    skippedNoPix: false,
+    skippedNoEmail,
+    emails: sentEmails,
+  };
+}
+
+apiRouter.get('/groups/:id/finance', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const groupId = Number(req.params.id);
+    if (!Number.isInteger(groupId) || groupId <= 0) {
+      return res.status(400).json({ error: 'ID da pelada inválido.' });
+    }
+
+    const authUser = req.authUser!;
+    const allowed =
+      (await isUserAdminOfGroup(authUser, groupId)) ||
+      (await hasActiveGroupAccess(authUser, groupId));
+    if (!allowed) {
+      return res.status(403).json({
+        error: 'Apenas participantes desta pelada têm acesso ao controle financeiro.',
+      });
+    }
+
+    const groupRows = await db
+      .select()
+      .from(peladaGroups)
+      .where(eq(peladaGroups.id, groupId))
+      .limit(1);
+    if (groupRows.length === 0) {
+      return res.status(404).json({ error: 'Pelada fixa não encontrada.' });
+    }
+    const group = groupRows[0];
+
+    const permissions = await getGroupFinancialPermission(authUser, groupId);
+
+    const [entryRows, paymentRows, pixEmailRows, groupPeladas, groupMemberRows] =
+      await Promise.all([
+        db
+          .select()
+          .from(peladaFinanceEntries)
+          .where(eq(peladaFinanceEntries.groupId, groupId))
+          .orderBy(desc(peladaFinanceEntries.entryDate), desc(peladaFinanceEntries.id)),
+        db
+          .select()
+          .from(peladaParticipantPayments)
+          .where(eq(peladaParticipantPayments.groupId, groupId))
+          .orderBy(desc(peladaParticipantPayments.createdAt), desc(peladaParticipantPayments.id)),
+        db
+          .select()
+          .from(peladaPixPaymentEmails)
+          .where(eq(peladaPixPaymentEmails.groupId, groupId))
+          .orderBy(desc(peladaPixPaymentEmails.sentAt))
+          .limit(50),
+        db
+          .select({
+            id: peladas.id,
+            title: peladas.title,
+            eventDate: peladas.eventDate,
+            status: peladas.status,
+          })
+          .from(peladas)
+          .where(eq(peladas.groupId, groupId))
+          .orderBy(desc(peladas.eventDate), desc(peladas.id)),
+        db
+          .select({
+            playerId: peladaGroupMembers.playerId,
+            playerCategory: peladaGroupMembers.playerCategory,
+            playerName: players.name,
+            playerNickname: players.nickname,
+            playerEmail: players.email,
+            userEmail: users.email,
+          })
+          .from(peladaGroupMembers)
+          .leftJoin(players, eq(peladaGroupMembers.playerId, players.id))
+          .leftJoin(users, eq(peladaGroupMembers.userId, users.id))
+          .where(eq(peladaGroupMembers.groupId, groupId)),
+      ]);
+
+    const extraUserIds = Array.from(
+      new Set(
+        [
+          ...entryRows.map((e) => e.createdByUserId),
+          ...paymentRows.map((p) => p.confirmedByUserId),
+        ].filter((id): id is number => id != null)
+      )
+    );
+    const userRows =
+      extraUserIds.length > 0
+        ? await db
+            .select({ id: users.id, name: users.name })
+            .from(users)
+            .where(inArray(users.id, extraUserIds))
+        : [];
+    const userNameMap = new Map(userRows.map((u) => [u.id, u.name]));
+
+    const allPayPlayerIds = Array.from(
+      new Set([
+        ...paymentRows.map((p) => p.playerId),
+        ...pixEmailRows.map((e) => e.playerId),
+      ])
+    );
+    const payPlayers =
+      allPayPlayerIds.length > 0
+        ? await db.select().from(players).where(inArray(players.id, allPayPlayerIds))
+        : [];
+    const payPlayerMap = new Map(payPlayers.map((p) => [p.id, p]));
+    const peladaTitleMap = new Map(groupPeladas.map((p) => [p.id, p.title]));
+
+    const initialCashBalance = round2(group.initialCashBalance ?? 0);
+    let cashBoxContributions = 0;
+    let extraIncome = 0;
+    let paidExpenses = 0;
+    let pendingDebts = 0;
+
+    for (const e of entryRows) {
+      if (e.entryType === 'cash_box' && e.status === 'settled') {
+        cashBoxContributions += e.amount;
+      } else if (e.entryType === 'income' && e.status === 'settled') {
+        extraIncome += e.amount;
+      } else if (e.entryType === 'expense' && e.status === 'settled') {
+        paidExpenses += e.amount;
+      } else if (
+        e.entryType === 'pending_debt' ||
+        (e.entryType === 'expense' && e.status === 'pending')
+      ) {
+        pendingDebts += e.amount;
+      }
+    }
+
+    let participantPaymentsReceived = 0;
+    let pendingReceivables = 0;
+    for (const pay of paymentRows) {
+      if (pay.status === 'paid') {
+        participantPaymentsReceived += pay.amount;
+      } else {
+        pendingReceivables += pay.amount;
+      }
+    }
+
+    const totalRevenue = round2(extraIncome + participantPaymentsReceived);
+    const currentCashBalance = round2(
+      initialCashBalance + cashBoxContributions + totalRevenue - paidExpenses
+    );
+    const projectedBalance = round2(currentCashBalance + pendingReceivables - pendingDebts);
+
+    const participantBalanceMap = new Map<
+      number,
+      {
+        playerId: number;
+        name: string;
+        nickname: string;
+        email: string | null;
+        category: string;
+        totalPaid: number;
+        totalPending: number;
+        pendingCount: number;
+        paidCount: number;
+      }
+    >();
+
+    for (const gm of groupMemberRows) {
+      if (!gm.playerId) continue;
+      participantBalanceMap.set(gm.playerId, {
+        playerId: gm.playerId,
+        name: gm.playerName ?? 'Participante',
+        nickname: gm.playerNickname ?? gm.playerName ?? 'Peladeiro',
+        email: gm.playerEmail ?? gm.userEmail ?? null,
+        category: gm.playerCategory ?? 'mensalista',
+        totalPaid: 0,
+        totalPending: 0,
+        pendingCount: 0,
+        paidCount: 0,
+      });
+    }
+
+    for (const pay of paymentRows) {
+      const pInfo = payPlayerMap.get(pay.playerId);
+      const cur = participantBalanceMap.get(pay.playerId) ?? {
+        playerId: pay.playerId,
+        name: pInfo?.name ?? 'Participante',
+        nickname: pInfo?.nickname ?? 'Peladeiro',
+        email: pInfo?.email ?? null,
+        category: pInfo?.category ?? 'mensalista',
+        totalPaid: 0,
+        totalPending: 0,
+        pendingCount: 0,
+        paidCount: 0,
+      };
+      if (pay.status === 'paid') {
+        cur.totalPaid = round2(cur.totalPaid + pay.amount);
+        cur.paidCount += 1;
+      } else {
+        cur.totalPending = round2(cur.totalPending + pay.amount);
+        cur.pendingCount += 1;
+      }
+      participantBalanceMap.set(pay.playerId, cur);
+    }
+
+    const participants = Array.from(participantBalanceMap.values()).sort(
+      (a, b) => b.totalPending - a.totalPending || a.nickname.localeCompare(b.nickname, 'pt-BR')
+    );
+
+    const memberCatMap = new Map(
+      groupMemberRows
+        .filter((m) => m.playerId != null)
+        .map((m) => [m.playerId!, m.playerCategory])
+    );
+
+    res.json({
+      group: {
+        id: group.id,
+        name: group.name,
+        pixKey: group.pixKey ?? null,
+        avulsoFee: group.avulsoFee ?? 0,
+        monthlyFee: group.monthlyFee ?? 0,
+        initialCashBalance,
+      },
+      permissions,
+      summary: {
+        initialCashBalance,
+        cashBoxContributions: round2(cashBoxContributions),
+        extraIncome: round2(extraIncome),
+        participantPaymentsReceived: round2(participantPaymentsReceived),
+        totalRevenue,
+        paidExpenses: round2(paidExpenses),
+        pendingDebts: round2(pendingDebts),
+        pendingReceivables: round2(pendingReceivables),
+        currentCashBalance,
+        projectedBalance,
+      },
+      entries: entryRows.map((e) => ({
+        ...e,
+        peladaTitle: e.peladaId ? (peladaTitleMap.get(e.peladaId) ?? null) : null,
+        createdByName: e.createdByUserId ? (userNameMap.get(e.createdByUserId) ?? null) : null,
+      })),
+      payments: paymentRows.map((pay) => {
+        const pInfo = payPlayerMap.get(pay.playerId);
+        return {
+          ...pay,
+          peladaTitle: pay.peladaId ? (peladaTitleMap.get(pay.peladaId) ?? null) : null,
+          playerName: pInfo?.name ?? 'Participante',
+          playerNickname: pInfo?.nickname ?? 'Peladeiro',
+          playerEmail: pInfo?.email ?? null,
+          playerCategory: memberCatMap.get(pay.playerId) ?? pInfo?.category ?? 'mensalista',
+          confirmedByName: pay.confirmedByUserId
+            ? (userNameMap.get(pay.confirmedByUserId) ?? null)
+            : null,
+        };
+      }),
+      pixEmails: pixEmailRows.map((em) => ({
+        ...em,
+        playerNickname: payPlayerMap.get(em.playerId)?.nickname ?? null,
+      })),
+      peladas: groupPeladas,
+      participants,
+    });
+  } catch (error) {
+    console.error('Erro ao carregar controle financeiro da pelada:', error);
+    res.status(500).json({ error: 'Falha ao carregar dados financeiros da pelada.' });
+  }
+});
+
+apiRouter.put('/groups/:id/finance/settings', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const groupId = Number(req.params.id);
+    if (!Number.isInteger(groupId) || groupId <= 0) {
+      return res.status(400).json({ error: 'ID inválido.' });
+    }
+    const allowed = await isUserAdminOfGroup(req.authUser!, groupId);
+    if (!allowed) {
+      return res.status(403).json({
+        error: 'Apenas administradores da pelada podem configurar o PIX e valores financeiros.',
+      });
+    }
+
+    const existing = await db
+      .select()
+      .from(peladaGroups)
+      .where(eq(peladaGroups.id, groupId))
+      .limit(1);
+    if (existing.length === 0) {
+      return res.status(404).json({ error: 'Pelada fixa não encontrada.' });
+    }
+    const prev = existing[0];
+
+    const pixKey =
+      req.body?.pixKey !== undefined
+        ? String(req.body.pixKey ?? '').trim().slice(0, 180) || null
+        : prev.pixKey;
+    const monthlyFee =
+      req.body?.monthlyFee !== undefined
+        ? parseNonNegativeFee(req.body.monthlyFee, prev.monthlyFee ?? 0)
+        : prev.monthlyFee ?? 0;
+    const avulsoFee =
+      req.body?.avulsoFee !== undefined
+        ? parseNonNegativeFee(req.body.avulsoFee, prev.avulsoFee ?? 0)
+        : prev.avulsoFee ?? 0;
+    const initialCashBalance =
+      req.body?.initialCashBalance !== undefined
+        ? (() => {
+            const raw =
+              typeof req.body.initialCashBalance === 'string'
+                ? req.body.initialCashBalance.replace(',', '.').trim()
+                : req.body.initialCashBalance;
+            const n = Number(raw);
+            return Number.isFinite(n) ? Math.max(-1000000, Math.min(1000000, round2(n))) : prev.initialCashBalance ?? 0;
+          })()
+        : prev.initialCashBalance ?? 0;
+
+    const updated = await db
+      .update(peladaGroups)
+      .set({ pixKey, monthlyFee, avulsoFee, initialCashBalance })
+      .where(eq(peladaGroups.id, groupId))
+      .returning();
+
+    res.json({ group: updated[0] });
+  } catch (error) {
+    console.error('Erro ao salvar configurações financeiras:', error);
+    res.status(500).json({ error: 'Falha ao salvar configurações financeiras.' });
+  }
+});
+
+apiRouter.post('/groups/:id/finance/entries', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const groupId = Number(req.params.id);
+    if (!Number.isInteger(groupId) || groupId <= 0) {
+      return res.status(400).json({ error: 'ID inválido.' });
+    }
+    const allowed = await isUserAdminOfGroup(req.authUser!, groupId);
+    if (!allowed) {
+      return res.status(403).json({
+        error: 'Apenas administradores da pelada podem lançar movimentações no caixa.',
+      });
+    }
+
+    const entryType = String(req.body?.entryType ?? '');
+    if (!VALID_FINANCE_ENTRY_TYPES.has(entryType)) {
+      return res.status(400).json({ error: 'Tipo de lançamento financeiro inválido.' });
+    }
+
+    const title = String(req.body?.title ?? '').trim().slice(0, 140);
+    if (!title) {
+      return res.status(400).json({ error: 'Informe o título ou descrição curta do lançamento.' });
+    }
+
+    const rawAmount =
+      typeof req.body?.amount === 'string' ? req.body.amount.replace(',', '.').trim() : req.body?.amount;
+    const amount = Number(rawAmount);
+    if (!Number.isFinite(amount) || amount <= 0 || amount > 1000000) {
+      return res.status(400).json({ error: 'Informe um valor válido maior que R$ 0,00.' });
+    }
+
+    const peladaId = req.body?.peladaId ? Number(req.body.peladaId) : null;
+    if (peladaId) {
+      const pCheck = await db
+        .select({ id: peladas.id })
+        .from(peladas)
+        .where(and(eq(peladas.id, peladaId), eq(peladas.groupId, groupId)))
+        .limit(1);
+      if (pCheck.length === 0) {
+        return res.status(400).json({ error: 'Encontro selecionado não pertence a esta pelada.' });
+      }
+    }
+
+    const description = String(req.body?.description ?? '').trim().slice(0, 1000) || null;
+    const attachmentUrl = sanitizeImageUrl(req.body?.attachmentUrl);
+    const entryDate =
+      typeof req.body?.entryDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.body.entryDate)
+        ? req.body.entryDate
+        : new Date().toISOString().slice(0, 10);
+
+    const status =
+      entryType === 'pending_debt'
+        ? 'pending'
+        : req.body?.status === 'pending'
+          ? 'pending'
+          : 'settled';
+
+    const inserted = await db
+      .insert(peladaFinanceEntries)
+      .values({
+        groupId,
+        peladaId: peladaId || null,
+        entryType,
+        title,
+        description,
+        amount: round2(amount),
+        status,
+        attachmentUrl,
+        entryDate,
+        createdByUserId: req.authUser!.id,
+      })
+      .returning();
+
+    res.status(201).json({ entry: inserted[0] });
+  } catch (error) {
+    console.error('Erro ao registrar lançamento financeiro:', error);
+    res.status(500).json({ error: 'Falha ao salvar lançamento financeiro.' });
+  }
+});
+
+apiRouter.patch('/groups/:id/finance/entries/:entryId', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const groupId = Number(req.params.id);
+    const entryId = Number(req.params.entryId);
+    if (!Number.isInteger(groupId) || !Number.isInteger(entryId)) {
+      return res.status(400).json({ error: 'Parâmetros inválidos.' });
+    }
+    const allowed = await isUserAdminOfGroup(req.authUser!, groupId);
+    if (!allowed) {
+      return res.status(403).json({ error: 'Apenas administradores da pelada podem editar lançamentos.' });
+    }
+
+    const existing = await db
+      .select()
+      .from(peladaFinanceEntries)
+      .where(and(eq(peladaFinanceEntries.id, entryId), eq(peladaFinanceEntries.groupId, groupId)))
+      .limit(1);
+    if (existing.length === 0) {
+      return res.status(404).json({ error: 'Lançamento não encontrado.' });
+    }
+    const prev = existing[0];
+
+    const nextStatus =
+      req.body?.status === 'settled' || req.body?.status === 'pending'
+        ? req.body.status
+        : prev.status;
+    const nextEntryType =
+      prev.entryType === 'pending_debt' && nextStatus === 'settled'
+        ? 'expense'
+        : prev.entryType;
+    const nextAttachment =
+      req.body?.attachmentUrl !== undefined
+        ? sanitizeImageUrl(req.body.attachmentUrl)
+        : prev.attachmentUrl;
+
+    const updated = await db
+      .update(peladaFinanceEntries)
+      .set({
+        status: nextStatus,
+        entryType: nextEntryType,
+        attachmentUrl: nextAttachment,
+        description:
+          req.body?.description !== undefined
+            ? String(req.body.description ?? '').trim().slice(0, 1000) || null
+            : prev.description,
+      })
+      .where(eq(peladaFinanceEntries.id, entryId))
+      .returning();
+
+    res.json({ entry: updated[0] });
+  } catch (error) {
+    console.error('Erro ao atualizar lançamento financeiro:', error);
+    res.status(500).json({ error: 'Falha ao atualizar lançamento.' });
+  }
+});
+
+apiRouter.delete('/groups/:id/finance/entries/:entryId', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const groupId = Number(req.params.id);
+    const entryId = Number(req.params.entryId);
+    if (!Number.isInteger(groupId) || !Number.isInteger(entryId)) {
+      return res.status(400).json({ error: 'Parâmetros inválidos.' });
+    }
+    const allowed = await isUserAdminOfGroup(req.authUser!, groupId);
+    if (!allowed) {
+      return res.status(403).json({ error: 'Apenas administradores da pelada podem excluir lançamentos.' });
+    }
+
+    await db
+      .delete(peladaFinanceEntries)
+      .where(and(eq(peladaFinanceEntries.id, entryId), eq(peladaFinanceEntries.groupId, groupId)));
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Erro ao remover lançamento financeiro:', error);
+    res.status(500).json({ error: 'Falha ao remover lançamento.' });
+  }
+});
+
+apiRouter.post('/groups/:id/finance/payments', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const groupId = Number(req.params.id);
+    if (!Number.isInteger(groupId) || groupId <= 0) {
+      return res.status(400).json({ error: 'ID inválido.' });
+    }
+    const allowed = await isUserAdminOfGroup(req.authUser!, groupId);
+    if (!allowed) {
+      return res.status(403).json({ error: 'Apenas administradores da pelada podem gerar cobranças.' });
+    }
+
+    const mode = String(req.body?.mode ?? 'single'); // 'single' | 'monthly_all' | 'pelada_present'
+    const paymentType = req.body?.paymentType === 'mensalidade' ? 'mensalidade' : 'diaria';
+    const peladaId = req.body?.peladaId ? Number(req.body.peladaId) : null;
+    const referenceLabel =
+      String(req.body?.referenceLabel ?? '').trim().slice(0, 120) ||
+      formatMonthYearRef(new Date().toISOString().slice(0, 10));
+
+    const groupRows = await db
+      .select()
+      .from(peladaGroups)
+      .where(eq(peladaGroups.id, groupId))
+      .limit(1);
+    if (groupRows.length === 0) return res.status(404).json({ error: 'Pelada não encontrada.' });
+    const group = groupRows[0];
+
+    const defaultAmount = paymentType === 'mensalidade' ? group.monthlyFee ?? 0 : group.avulsoFee ?? 0;
+    const rawAmount =
+      req.body?.amount !== undefined && String(req.body.amount).trim() !== ''
+        ? Number(String(req.body.amount).replace(',', '.'))
+        : defaultAmount;
+    if (!Number.isFinite(rawAmount) || rawAmount <= 0 || rawAmount > 100000) {
+      return res.status(400).json({ error: 'Informe um valor válido maior que R$ 0,00.' });
+    }
+    const amount = round2(rawAmount);
+
+    if (mode === 'pelada_present' && peladaId) {
+      const resSync = await ensurePeladaChargesAndSendPixEmails({
+        groupId,
+        peladaId,
+        createMissingForPelada: true,
+        sendEmails: false,
+      });
+      return res.status(201).json({ createdCount: resSync.chargesCreated });
+    }
+
+    if (mode === 'monthly_all') {
+      const members = await db
+        .select({
+          playerId: peladaGroupMembers.playerId,
+          userId: peladaGroupMembers.userId,
+          playerCategory: peladaGroupMembers.playerCategory,
+        })
+        .from(peladaGroupMembers)
+        .where(
+          and(
+            eq(peladaGroupMembers.groupId, groupId),
+            eq(peladaGroupMembers.playerCategory, 'mensalista'),
+            isNotNull(peladaGroupMembers.playerId)
+          )
+        );
+      const existing = await db
+        .select()
+        .from(peladaParticipantPayments)
+        .where(
+          and(
+            eq(peladaParticipantPayments.groupId, groupId),
+            eq(peladaParticipantPayments.paymentType, 'mensalidade'),
+            eq(peladaParticipantPayments.referenceLabel, referenceLabel)
+          )
+        );
+      const existingSet = new Set(existing.map((e) => e.playerId));
+      let createdCount = 0;
+      for (const m of members) {
+        if (!m.playerId || existingSet.has(m.playerId)) continue;
+        await db.insert(peladaParticipantPayments).values({
+          groupId,
+          peladaId: peladaId || null,
+          playerId: m.playerId,
+          userId: m.userId ?? null,
+          paymentType: 'mensalidade',
+          referenceLabel,
+          amount,
+          status: 'pending',
+          notes: String(req.body?.notes ?? '').trim().slice(0, 300) || null,
+        });
+        createdCount++;
+      }
+      return res.status(201).json({ createdCount });
+    }
+
+    const playerId = Number(req.body?.playerId);
+    if (!Number.isInteger(playerId) || playerId <= 0) {
+      return res.status(400).json({ error: 'Selecione o participante para lançar a cobrança.' });
+    }
+    const playerRows = await db.select().from(players).where(eq(players.id, playerId)).limit(1);
+    if (playerRows.length === 0) {
+      return res.status(404).json({ error: 'Participante não encontrado.' });
+    }
+
+    const markPaid = req.body?.status === 'paid';
+    let perm: Awaited<ReturnType<typeof getGroupFinancialPermission>> | null = null;
+    if (markPaid) {
+      perm = await getGroupFinancialPermission(req.authUser!, groupId);
+      if (!perm.canConfirmPayments) {
+        return res.status(403).json({
+          error:
+            'Somente o administrador com função de Presidente e/ou Tesoureiro pode marcar mensalidades e diárias como recebidas.',
+        });
+      }
+    }
+
+    const inserted = await db
+      .insert(peladaParticipantPayments)
+      .values({
+        groupId,
+        peladaId: peladaId || null,
+        playerId,
+        userId: playerRows[0].userId ?? null,
+        paymentType,
+        referenceLabel,
+        amount,
+        status: markPaid ? 'paid' : 'pending',
+        paidAt: markPaid ? new Date() : null,
+        confirmedByUserId: markPaid ? req.authUser!.id : null,
+        confirmedByRole: markPaid ? perm?.myAdminTitle ?? null : null,
+        notes: String(req.body?.notes ?? '').trim().slice(0, 300) || null,
+        attachmentUrl: sanitizeImageUrl(req.body?.attachmentUrl),
+      })
+      .returning();
+
+    res.status(201).json({ payment: inserted[0], createdCount: 1 });
+  } catch (error) {
+    console.error('Erro ao lançar cobrança de participante:', error);
+    res.status(500).json({ error: 'Falha ao lançar mensalidade ou diária.' });
+  }
+});
+
+apiRouter.post(
+  '/groups/:id/finance/payments/:paymentId/confirm',
+  requireAuth,
+  async (req: AuthRequest, res) => {
+    try {
+      const groupId = Number(req.params.id);
+      const paymentId = Number(req.params.paymentId);
+      if (!Number.isInteger(groupId) || !Number.isInteger(paymentId)) {
+        return res.status(400).json({ error: 'Parâmetros inválidos.' });
+      }
+
+      const perm = await getGroupFinancialPermission(req.authUser!, groupId);
+      if (!perm.canConfirmPayments) {
+        return res.status(403).json({
+          error:
+            'Somente o administrador com função de Presidente e/ou Tesoureiro pode marcar mensalidades e diárias como recebidas.',
+        });
+      }
+
+      const existing = await db
+        .select()
+        .from(peladaParticipantPayments)
+        .where(
+          and(
+            eq(peladaParticipantPayments.id, paymentId),
+            eq(peladaParticipantPayments.groupId, groupId)
+          )
+        )
+        .limit(1);
+      if (existing.length === 0) {
+        return res.status(404).json({ error: 'Cobrança não encontrada.' });
+      }
+
+      const nextStatus = req.body?.status === 'pending' ? 'pending' : 'paid';
+      const attachmentUrl =
+        req.body?.attachmentUrl !== undefined
+          ? sanitizeImageUrl(req.body.attachmentUrl)
+          : existing[0].attachmentUrl;
+
+      const updated = await db
+        .update(peladaParticipantPayments)
+        .set({
+          status: nextStatus,
+          paidAt: nextStatus === 'paid' ? new Date() : null,
+          confirmedByUserId: nextStatus === 'paid' ? req.authUser!.id : null,
+          confirmedByRole: nextStatus === 'paid' ? perm.myAdminTitle : null,
+          attachmentUrl,
+          notes:
+            req.body?.notes !== undefined
+              ? String(req.body.notes ?? '').trim().slice(0, 300) || null
+              : existing[0].notes,
+        })
+        .where(eq(peladaParticipantPayments.id, paymentId))
+        .returning();
+
+      res.json({ payment: updated[0] });
+    } catch (error) {
+      console.error('Erro ao confirmar recebimento:', error);
+      res.status(500).json({ error: 'Falha ao confirmar recebimento do pagamento.' });
+    }
+  }
+);
+
+apiRouter.delete(
+  '/groups/:id/finance/payments/:paymentId',
+  requireAuth,
+  async (req: AuthRequest, res) => {
+    try {
+      const groupId = Number(req.params.id);
+      const paymentId = Number(req.params.paymentId);
+      if (!Number.isInteger(groupId) || !Number.isInteger(paymentId)) {
+        return res.status(400).json({ error: 'Parâmetros inválidos.' });
+      }
+      const perm = await getGroupFinancialPermission(req.authUser!, groupId);
+      if (!perm.canConfirmPayments && !perm.isGroupAdmin) {
+        return res.status(403).json({ error: 'Apenas administradores podem excluir cobranças.' });
+      }
+      await db
+        .delete(peladaParticipantPayments)
+        .where(
+          and(
+            eq(peladaParticipantPayments.id, paymentId),
+            eq(peladaParticipantPayments.groupId, groupId)
+          )
+        );
+      res.json({ ok: true });
+    } catch (error) {
+      console.error('Erro ao excluir cobrança:', error);
+      res.status(500).json({ error: 'Falha ao excluir cobrança.' });
+    }
+  }
+);
+
+apiRouter.post('/groups/:id/finance/send-pix-emails', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const groupId = Number(req.params.id);
+    if (!Number.isInteger(groupId) || groupId <= 0) {
+      return res.status(400).json({ error: 'ID inválido.' });
+    }
+    const allowed = await isUserAdminOfGroup(req.authUser!, groupId);
+    if (!allowed) {
+      return res.status(403).json({
+        error: 'Apenas administradores da pelada podem enviar e-mails de cobrança PIX.',
+      });
+    }
+
+    const peladaId = req.body?.peladaId ? Number(req.body.peladaId) : null;
+    const createMissingForPelada = req.body?.createMissingForPelada === true;
+
+    const result = await ensurePeladaChargesAndSendPixEmails({
+      groupId,
+      peladaId,
+      createMissingForPelada,
+      sendEmails: true,
+    });
+
+    if (result.skippedNoPix) {
+      return res.status(400).json({
+        error: 'Configure a chave PIX da pelada antes de enviar os e-mails de cobrança.',
+      });
+    }
+
+    res.json(result);
+  } catch (error) {
+    console.error('Erro ao enviar e-mails PIX:', error);
+    res.status(500).json({ error: 'Falha ao gerar e-mails de cobrança PIX.' });
+  }
+});
+
+apiRouter.get('/my-pix-emails', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const authUser = req.authUser!;
+    const conds = [eq(peladaPixPaymentEmails.userId, authUser.id)];
+    if (authUser.playerId) conds.push(eq(peladaPixPaymentEmails.playerId, authUser.playerId));
+    if (authUser.email) conds.push(eq(peladaPixPaymentEmails.toEmail, authUser.email.toLowerCase()));
+
+    const rows = await db
+      .select()
+      .from(peladaPixPaymentEmails)
+      .where(or(...conds))
+      .orderBy(desc(peladaPixPaymentEmails.sentAt))
+      .limit(30);
+
+    res.json(rows);
+  } catch (error) {
+    console.error('Erro ao listar seus e-mails PIX:', error);
+    res.status(500).json({ error: 'Falha ao carregar e-mails de cobrança PIX.' });
+  }
+});
+

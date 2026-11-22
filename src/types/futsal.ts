@@ -136,6 +136,11 @@ export interface PeladaGroupSummary {
   weekday: string;
   startTime: string;
   location: string;
+  fullAddress?: string | null;
+  avulsoFee?: number | null;
+  monthlyFee?: number | null;
+  initialCashBalance?: number | null;
+  pixKey?: string | null;
   playersPerTeam: number;
   defaultTeamsCount: number;
   photoUrl: string | null;
@@ -145,6 +150,8 @@ export interface PeladaGroupSummary {
   peladasCount: number;
   openSeasonName: string | null;
   myMemberRole: 'admin' | 'member';
+  myAdminTitle?: AdminTitle | null;
+  canConfirmPayments?: boolean;
   isGroupAdmin?: boolean;
   criteriaConfig?: GroupCriterion[];
   membershipStatus?: 'member' | 'pending' | 'rejected' | 'expired' | 'none';
@@ -171,12 +178,19 @@ export interface PeladaGroupSummary {
   }>;
 }
 
+export type AdminTitle =
+  | 'presidente'
+  | 'tesoureiro'
+  | 'presidente_tesoureiro'
+  | 'administrador';
+
 export interface PeladaGroupMember {
   id: number;
   groupId: number;
   userId: number | null;
   playerId: number | null;
   memberRole: 'admin' | 'member';
+  adminTitle?: AdminTitle | null;
   playerCategory: PlayerCategory;
   accessPeladaId?: number | null;
   accessExpiresAt?: string | null;
@@ -383,10 +397,24 @@ export interface InviteEmailRecord {
   id: number;
   userId: number;
   playerId: number | null;
+  groupId?: number | null;
+  invitedByUserId?: number | null;
+  avulsoFee?: number | null;
   toEmail: string;
   subject: string;
   bodyText: string;
   inviteLink: string;
+  status: string;
+  createdAt: string;
+}
+
+export interface PasswordResetEmailRecord {
+  id: number;
+  userId: number;
+  toEmail: string;
+  subject: string;
+  bodyText: string;
+  resetLink: string;
   status: string;
   createdAt: string;
 }
@@ -509,3 +537,115 @@ export interface PlayerSummaryEmailRecord {
   status: string;
   sentAt: string;
 }
+
+export type FinanceEntryType = 'cash_box' | 'income' | 'expense' | 'pending_debt';
+
+export interface PeladaFinanceEntry {
+  id: number;
+  groupId: number;
+  peladaId: number | null;
+  peladaTitle?: string | null;
+  entryType: FinanceEntryType;
+  title: string;
+  description: string | null;
+  amount: number;
+  status: 'settled' | 'pending';
+  attachmentUrl: string | null;
+  entryDate: string;
+  createdByUserId: number | null;
+  createdByName?: string | null;
+  createdAt: string;
+}
+
+export interface PeladaParticipantPayment {
+  id: number;
+  groupId: number;
+  peladaId: number | null;
+  peladaTitle?: string | null;
+  playerId: number;
+  playerName: string;
+  playerNickname: string;
+  playerEmail: string | null;
+  playerCategory: PlayerCategory;
+  userId: number | null;
+  paymentType: 'mensalidade' | 'diaria';
+  referenceLabel: string;
+  amount: number;
+  status: 'pending' | 'paid';
+  paidAt: string | null;
+  confirmedByUserId: number | null;
+  confirmedByName?: string | null;
+  confirmedByRole: string | null;
+  notes: string | null;
+  attachmentUrl: string | null;
+  pixEmailSentAt: string | null;
+  createdAt: string;
+}
+
+export interface PeladaPixPaymentEmail {
+  id: number;
+  groupId: number;
+  peladaId: number | null;
+  paymentId: number | null;
+  userId: number | null;
+  playerId: number;
+  playerNickname?: string | null;
+  toEmail: string;
+  subject: string;
+  bodyText: string;
+  pixKey: string;
+  amount: number;
+  status: string;
+  sentAt: string;
+}
+
+export interface PeladaFinanceSummary {
+  initialCashBalance: number;
+  cashBoxContributions: number;
+  extraIncome: number;
+  participantPaymentsReceived: number;
+  totalRevenue: number;
+  paidExpenses: number;
+  pendingDebts: number;
+  pendingReceivables: number;
+  currentCashBalance: number;
+  projectedBalance: number;
+}
+
+export interface PeladaFinanceOverviewResponse {
+  group: {
+    id: number;
+    name: string;
+    pixKey: string | null;
+    avulsoFee: number;
+    monthlyFee: number;
+    initialCashBalance: number;
+  };
+  permissions: {
+    isGroupAdmin: boolean;
+    myAdminTitle: AdminTitle | null;
+    canConfirmPayments: boolean;
+  };
+  summary: PeladaFinanceSummary;
+  entries: PeladaFinanceEntry[];
+  payments: PeladaParticipantPayment[];
+  pixEmails: PeladaPixPaymentEmail[];
+  peladas: Array<{
+    id: number;
+    title: string;
+    eventDate: string;
+    status: string;
+  }>;
+  participants: Array<{
+    playerId: number;
+    name: string;
+    nickname: string;
+    email: string | null;
+    category: PlayerCategory;
+    totalPaid: number;
+    totalPending: number;
+    pendingCount: number;
+    paidCount: number;
+  }>;
+}
+

@@ -5,9 +5,11 @@ import {
   BarChart3,
   Bell,
   CalendarDays,
+  Check,
   CheckCircle2,
   ChevronRight,
   Clock,
+  Copy,
   Edit3,
   KeyRound,
   LogOut,
@@ -15,12 +17,14 @@ import {
   MapPin,
   Plus,
   Search,
+  Send,
   Sliders,
   Trophy,
   UserCheck,
   UserPlus,
   Users,
   Vote,
+  Wallet,
 } from 'lucide-react';
 import { AdminAccessView } from './components/AdminAccessView';
 import { AuthView } from './components/AuthView';
@@ -30,6 +34,7 @@ import { InitialRatingVoteModal } from './components/InitialRatingVoteModal';
 import { JoinPeladaRequestModal } from './components/JoinPeladaRequestModal';
 import { JoinRequestsModal } from './components/JoinRequestsModal';
 import { MyProfileModal } from './components/MyProfileModal';
+import { PeladaFinanceView } from './components/PeladaFinanceView';
 import { PeladaWorkspace } from './components/PeladaWorkspace';
 import { PlayerAvatar } from './components/PlayerAvatar';
 import { PlayerDetailModal } from './components/PlayerDetailModal';
@@ -53,7 +58,7 @@ import {
   type Season,
 } from './types/futsal';
 
-type NavSection = 'peladas' | 'players' | 'seasons' | 'access';
+type NavSection = 'peladas' | 'players' | 'seasons' | 'finance' | 'access';
 
 const WEEKDAYS = [
   'Segunda-feira',
@@ -65,6 +70,14 @@ const WEEKDAYS = [
   'Domingo',
 ];
 
+function formatCurrencyBrl(value?: number | null): string {
+  const num = typeof value === 'number' && Number.isFinite(value) ? value : 0;
+  return new Intl.NumberFormat('pt-BR', {
+    style: 'currency',
+    currency: 'BRL',
+  }).format(num);
+}
+
 export default function App() {
   const [authReady, setAuthReady] = useState(false);
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
@@ -73,6 +86,10 @@ export default function App() {
   const [inviteToken, setInviteToken] = useState<string | null>(() => {
     const params = new URLSearchParams(window.location.search);
     return params.get('convite');
+  });
+  const [resetToken, setResetToken] = useState<string | null>(() => {
+    const params = new URLSearchParams(window.location.search);
+    return params.get('redefinir');
   });
 
   // Top-level fixed peladas (groups) vs selected group & screen inside it
@@ -91,6 +108,8 @@ export default function App() {
   const [showNewGroupForm, setShowNewGroupForm] = useState(false);
   const [groupName, setGroupName] = useState('');
   const [groupLocation, setGroupLocation] = useState('Quadra Central');
+  const [groupFullAddress, setGroupFullAddress] = useState('');
+  const [groupAvulsoFee, setGroupAvulsoFee] = useState('0');
   const [groupWeekday, setGroupWeekday] = useState('Quarta-feira');
   const [groupStartTime, setGroupStartTime] = useState('20:00');
   const [groupPerTeam, setGroupPerTeam] = useState(5);
@@ -102,6 +121,19 @@ export default function App() {
     `Temporada ${new Date().getFullYear()}`
   );
   const [groupSelectedPlayerIds, setGroupSelectedPlayerIds] = useState<number[]>([]);
+
+  // Inline edit of Fixed Pelada info & Convida Peladeiro (Level 2 header)
+  const [editingGroupInfo, setEditingGroupInfo] = useState(false);
+  const [editGroupLocation, setEditGroupLocation] = useState('');
+  const [editGroupFullAddress, setEditGroupFullAddress] = useState('');
+  const [editGroupAvulsoFee, setEditGroupAvulsoFee] = useState('0');
+  const [savingGroupInfo, setSavingGroupInfo] = useState(false);
+
+  const [inviteGuestEmail, setInviteGuestEmail] = useState('');
+  const [inviteGuestAvulsoFee, setInviteGuestAvulsoFee] = useState('0');
+  const [sendingGroupInvite, setSendingGroupInvite] = useState(false);
+  const [generatedGroupInvite, setGeneratedGroupInvite] = useState<InviteEmailRecord | null>(null);
+  const [copiedGroupInvite, setCopiedGroupInvite] = useState(false);
 
   // New Encontro (Pelada session) form inside a Fixed Pelada
   const [showNewPeladaForm, setShowNewPeladaForm] = useState(false);
@@ -157,6 +189,13 @@ export default function App() {
     window.history.replaceState({}, '', url.toString());
   }, []);
 
+  const clearResetUrl = useCallback(() => {
+    setResetToken(null);
+    const url = new URL(window.location.href);
+    url.searchParams.delete('redefinir');
+    window.history.replaceState({}, '', url.toString());
+  }, []);
+
   useEffect(() => {
     registerFirebaseTokenResolver(async () => {
       const current = auth.currentUser;
@@ -165,7 +204,7 @@ export default function App() {
     });
 
     const unsub = onAuthStateChanged(auth, async (fbUser) => {
-      if (fbUser && !inviteToken) {
+      if (fbUser && !inviteToken && !resetToken) {
         try {
           const token = await fbUser.getIdToken();
           const me = await apiFetch<{ user: AuthUser; player: Player | null }>('/api/auth/me', {
@@ -184,7 +223,7 @@ export default function App() {
       unsub();
       registerFirebaseTokenResolver(null);
     };
-  }, [inviteToken]);
+  }, [inviteToken, resetToken]);
 
   const loadGroups = useCallback(async () => {
     const list = await apiFetch<PeladaGroupSummary[]>('/api/groups');
@@ -273,6 +312,10 @@ export default function App() {
       setPeladaTime(g.startTime);
       setPeladaPerTeam(g.playersPerTeam);
       setPeladaTeamsCount(String(g.defaultTeamsCount));
+      setEditGroupLocation(g.location);
+      setEditGroupFullAddress(g.fullAddress ?? '');
+      setEditGroupAvulsoFee(String(g.avulsoFee ?? 0));
+      setInviteGuestAvulsoFee(String(g.avulsoFee ?? 0));
     }
 
     setLoadingData(true);
@@ -301,6 +344,10 @@ export default function App() {
     setActivePeladaId(null);
     setShowNewPeladaForm(false);
     setShowNewSeasonInline(false);
+    setEditingGroupInfo(false);
+    setGeneratedGroupInvite(null);
+    setInviteGuestEmail('');
+    setCopiedGroupInvite(false);
     setAppError(null);
   }
 
@@ -309,6 +356,10 @@ export default function App() {
     setActivePeladaId(null);
     setShowNewPeladaForm(false);
     setShowNewSeasonInline(false);
+    setEditingGroupInfo(false);
+    setGeneratedGroupInvite(null);
+    setInviteGuestEmail('');
+    setCopiedGroupInvite(false);
     setAppError(null);
     loadGroups().catch(() => {});
   }
@@ -334,6 +385,8 @@ export default function App() {
     setActiveGroupId(null);
     setActivePeladaId(null);
     setLatestInviteBanner(null);
+    setGeneratedGroupInvite(null);
+    setEditingGroupInfo(false);
   }
 
   async function handleCreateGroup(e: React.FormEvent) {
@@ -343,6 +396,11 @@ export default function App() {
       setAppError('Informe uma quantidade padrão válida de times (entre 2 e 12).');
       return;
     }
+    const parsedFee = Number(groupAvulsoFee.replace(',', '.'));
+    if (groupAvulsoFee.trim() !== '' && (!Number.isFinite(parsedFee) || parsedFee < 0)) {
+      setAppError('Informe um valor de avulso válido (maior ou igual a R$ 0,00).');
+      return;
+    }
     setAppError(null);
     try {
       const res = await apiFetch<{ group: PeladaGroupSummary }>('/api/groups', {
@@ -350,6 +408,8 @@ export default function App() {
         body: JSON.stringify({
           name: groupName,
           location: groupLocation,
+          fullAddress: groupFullAddress.trim() || null,
+          avulsoFee: Number.isFinite(parsedFee) && parsedFee >= 0 ? parsedFee : 0,
           weekday: groupWeekday,
           startTime: groupStartTime,
           playersPerTeam: groupPerTeam,
@@ -362,6 +422,8 @@ export default function App() {
         }),
       });
       setGroupName('');
+      setGroupFullAddress('');
+      setGroupAvulsoFee('0');
       setGroupDescription('');
       setGroupPhotoUrl(null);
       setGroupSelectedPlayerIds([]);
@@ -370,6 +432,71 @@ export default function App() {
       openFixedPelada(res.group.id, 'peladas');
     } catch (err: unknown) {
       setAppError(err instanceof Error ? err.message : 'Erro ao criar pelada fixa.');
+    }
+  }
+
+  async function handleSaveGroupInfo(e: React.FormEvent) {
+    e.preventDefault();
+    if (activeGroupId === null) return;
+    const parsedFee = Number(editGroupAvulsoFee.replace(',', '.'));
+    if (editGroupAvulsoFee.trim() !== '' && (!Number.isFinite(parsedFee) || parsedFee < 0)) {
+      setAppError('Informe um valor de avulso válido (maior ou igual a R$ 0,00).');
+      return;
+    }
+    setSavingGroupInfo(true);
+    setAppError(null);
+    try {
+      await apiFetch(`/api/groups/${activeGroupId}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          location: editGroupLocation.trim() || 'Quadra Principal',
+          fullAddress: editGroupFullAddress.trim() || null,
+          avulsoFee: Number.isFinite(parsedFee) && parsedFee >= 0 ? parsedFee : 0,
+        }),
+      });
+      setEditingGroupInfo(false);
+      setInviteGuestAvulsoFee(String(Number.isFinite(parsedFee) && parsedFee >= 0 ? parsedFee : 0));
+      await loadGroups();
+    } catch (err: unknown) {
+      setAppError(err instanceof Error ? err.message : 'Erro ao atualizar informações da pelada.');
+    } finally {
+      setSavingGroupInfo(false);
+    }
+  }
+
+  async function handleInvitePlayerToGroup(e: React.FormEvent) {
+    e.preventDefault();
+    if (activeGroupId === null) return;
+    const email = inviteGuestEmail.trim();
+    if (!email || !email.includes('@')) {
+      setAppError('Informe um e-mail válido para convidar o peladeiro.');
+      return;
+    }
+    const parsedFee = Number(inviteGuestAvulsoFee.replace(',', '.'));
+    if (inviteGuestAvulsoFee.trim() !== '' && (!Number.isFinite(parsedFee) || parsedFee < 0)) {
+      setAppError('Informe um valor de avulso válido (maior ou igual a R$ 0,00).');
+      return;
+    }
+    setSendingGroupInvite(true);
+    setAppError(null);
+    setCopiedGroupInvite(false);
+    try {
+      const res = await apiFetch<{ invite: InviteEmailRecord; avulsoFee: number }>(
+        `/api/groups/${activeGroupId}/invite-player`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            email,
+            avulsoFee: Number.isFinite(parsedFee) && parsedFee >= 0 ? parsedFee : undefined,
+          }),
+        }
+      );
+      setGeneratedGroupInvite(res.invite);
+      setInviteGuestEmail('');
+    } catch (err: unknown) {
+      setAppError(err instanceof Error ? err.message : 'Erro ao gerar convite por e-mail.');
+    } finally {
+      setSendingGroupInvite(false);
     }
   }
 
@@ -473,11 +600,13 @@ export default function App() {
     );
   }
 
-  if (!authUser || inviteToken) {
+  if (!authUser || inviteToken || resetToken) {
     return (
       <AuthView
         inviteToken={inviteToken}
+        resetToken={resetToken}
         onClearInviteToken={clearInviteUrl}
+        onClearResetToken={clearResetUrl}
         onAuthSuccess={(payload) => {
           setAuthUser(payload.user);
           setMyPlayer(payload.player);
@@ -522,6 +651,7 @@ export default function App() {
     peladas: activePeladaId ? 'Controle da Quadra' : 'Jogos & Encontros',
     players: 'Elenco & Avaliações',
     seasons: 'Temporadas & Estatísticas',
+    finance: 'Controle Financeiro',
     access: 'Membros & Acessos',
   };
 
@@ -620,7 +750,16 @@ export default function App() {
                   setActivePeladaId(null);
                 }}
               />
-              {isAdmin && (
+              <SidebarButton
+                active={section === 'finance'}
+                icon={<Wallet className="h-4 w-4" />}
+                label="Financeiro & PIX"
+                onClick={() => {
+                  setSection('finance');
+                  setActivePeladaId(null);
+                }}
+              />
+              {isPeladaAdmin && (
                 <SidebarButton
                   active={section === 'access'}
                   icon={<KeyRound className="h-4 w-4" />}
@@ -742,7 +881,19 @@ export default function App() {
                 >
                   Ranking
                 </button>
-                {isAdmin && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSection('finance');
+                    setActivePeladaId(null);
+                  }}
+                  className={`hover:text-slate-900 whitespace-nowrap shrink-0 cursor-pointer ${
+                    section === 'finance' ? 'text-emerald-700 underline underline-offset-4' : ''
+                  }`}
+                >
+                  Financeiro
+                </button>
+                {isPeladaAdmin && (
                   <button
                     type="button"
                     onClick={() => {
@@ -909,8 +1060,8 @@ export default function App() {
               </div>
             )}
 
-            {isAdmin ? (
-              activeGroup === null ? (
+            {activeGroup === null ? (
+              isAdmin ? (
                 <button
                   type="button"
                   onClick={() => setShowNewGroupForm((v) => !v)}
@@ -922,21 +1073,30 @@ export default function App() {
               ) : (
                 <button
                   type="button"
-                  onClick={() => {
-                    if (section === 'players') {
-                      setEditingPlayer('new');
-                    } else {
-                      setSection('peladas');
-                      setActivePeladaId(null);
-                      setShowNewPeladaForm(true);
-                    }
-                  }}
-                  className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-emerald-700 whitespace-nowrap shrink-0 cursor-pointer"
+                  onClick={() => setShowMyProfile(true)}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3.5 py-2 text-xs font-semibold text-white hover:bg-slate-800 whitespace-nowrap shrink-0 cursor-pointer"
                 >
-                  <Plus className="h-4 w-4" />
-                  {section === 'players' ? 'Novo Jogador' : 'Novo Encontro'}
+                  <UserCheck className="h-4 w-4" />
+                  Minha Ficha
                 </button>
               )
+            ) : isPeladaAdmin ? (
+              <button
+                type="button"
+                onClick={() => {
+                  if (section === 'players') {
+                    setEditingPlayer('new');
+                  } else {
+                    setSection('peladas');
+                    setActivePeladaId(null);
+                    setShowNewPeladaForm(true);
+                  }
+                }}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-emerald-700 whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <Plus className="h-4 w-4" />
+                {section === 'players' ? 'Novo Jogador' : 'Novo Encontro'}
+              </button>
             ) : (
               <button
                 type="button"
@@ -1127,6 +1287,34 @@ export default function App() {
                         onChange={(e) => setGroupLocation(e.target.value)}
                         placeholder="Ex: Arena Paulista"
                         className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                      />
+                    </div>
+
+                    <div className="sm:col-span-4">
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">
+                        Endereço completo *
+                      </label>
+                      <input
+                        required
+                        value={groupFullAddress}
+                        onChange={(e) => setGroupFullAddress(e.target.value)}
+                        placeholder="Ex: Rua das Quadras, 250 - Bela Vista, São Paulo - SP"
+                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                      />
+                    </div>
+
+                    <div className="sm:col-span-2">
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">
+                        Valor do avulso (R$)
+                      </label>
+                      <input
+                        type="number"
+                        step="0.50"
+                        min={0}
+                        value={groupAvulsoFee}
+                        onChange={(e) => setGroupAvulsoFee(e.target.value)}
+                        placeholder="25.00"
+                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm tabular-nums"
                       />
                     </div>
 
@@ -1377,8 +1565,14 @@ export default function App() {
                               <MapPin className="h-3.5 w-3.5 text-slate-400 shrink-0" />
                               <span>
                                 {g.location} · Formato {g.playersPerTeam}×{g.playersPerTeam}
+                                {(g.avulsoFee ?? 0) > 0 ? ` · Avulso ${formatCurrencyBrl(g.avulsoFee)}` : ''}
                               </span>
                             </p>
+                            {g.fullAddress && (
+                              <p className="text-[11px] text-slate-500 pl-5 line-clamp-1">
+                                {g.fullAddress}
+                              </p>
+                            )}
                             {g.description && (
                               <p className="text-slate-500 line-clamp-2">{g.description}</p>
                             )}
@@ -1448,6 +1642,14 @@ export default function App() {
                                 >
                                   Ranking
                                 </button>
+                                <span>·</span>
+                                <button
+                                  type="button"
+                                  onClick={() => openFixedPelada(g.id, 'finance')}
+                                  className="hover:text-emerald-700 cursor-pointer"
+                                >
+                                  Financeiro
+                                </button>
                                 {g.isGroupAdmin && pendingReqs > 0 && (
                                   <>
                                     <span>·</span>
@@ -1516,8 +1718,8 @@ export default function App() {
             <div className="space-y-6">
               {/* Pelada Header & Screen Selector inside <main> */}
               <div className="rounded-xl border border-slate-200 bg-white p-4 sm:p-5 space-y-4">
-                <div className="flex flex-wrap items-center justify-between gap-4">
-                  <div className="flex items-center gap-3.5 min-w-0">
+                <div className="flex flex-wrap items-start justify-between gap-4">
+                  <div className="flex items-start gap-3.5 min-w-0 flex-1">
                     <img
                       src={
                         activeGroup.photoUrl ||
@@ -1525,9 +1727,9 @@ export default function App() {
                       }
                       alt={activeGroup.name}
                       referrerPolicy="no-referrer"
-                      className="h-12 w-12 rounded-lg object-cover border border-slate-200 shrink-0"
+                      className="h-12 w-12 rounded-lg object-cover border border-slate-200 shrink-0 mt-1"
                     />
-                    <div className="min-w-0">
+                    <div className="min-w-0 flex-1">
                       <button
                         type="button"
                         onClick={backToFixedPeladasList}
@@ -1538,10 +1740,37 @@ export default function App() {
                       <h2 className="font-display text-2xl sm:text-3xl font-extrabold text-slate-900 truncate">
                         {activeGroup.name}
                       </h2>
-                      <p className="text-xs text-slate-500 truncate">
+                      <p className="text-xs text-slate-600">
                         {activeGroup.weekday} às {activeGroup.startTime} · {activeGroup.location} ·
-                        Formato {activeGroup.playersPerTeam}×{activeGroup.playersPerTeam}
+                        Formato {activeGroup.playersPerTeam}×{activeGroup.playersPerTeam} · Avulso:{' '}
+                        <strong className="text-emerald-700">
+                          {(activeGroup.avulsoFee ?? 0) > 0
+                            ? formatCurrencyBrl(activeGroup.avulsoFee)
+                            : 'Gratuito (R$ 0,00)'}
+                        </strong>
                       </p>
+                      <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
+                        <span className="inline-flex items-center gap-1">
+                          <MapPin className="h-3.5 w-3.5 text-slate-400 shrink-0" />
+                          <strong className="font-semibold text-slate-700">Endereço completo:</strong>{' '}
+                          {activeGroup.fullAddress?.trim() || 'Não informado'}
+                        </span>
+                        {isPeladaAdmin && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setEditGroupLocation(activeGroup.location);
+                              setEditGroupFullAddress(activeGroup.fullAddress ?? '');
+                              setEditGroupAvulsoFee(String(activeGroup.avulsoFee ?? 0));
+                              setEditingGroupInfo((v) => !v);
+                            }}
+                            className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 hover:text-emerald-800 cursor-pointer"
+                          >
+                            <Edit3 className="h-3 w-3" />
+                            {editingGroupInfo ? 'Fechar edição' : 'Editar endereço e valor'}
+                          </button>
+                        )}
+                      </div>
                     </div>
                   </div>
 
@@ -1561,6 +1790,164 @@ export default function App() {
                           </option>
                         ))}
                       </select>
+                    </div>
+                  )}
+                </div>
+
+                {editingGroupInfo && isPeladaAdmin && (
+                  <form
+                    onSubmit={handleSaveGroupInfo}
+                    className="rounded-lg border border-slate-200 bg-slate-50 p-3.5 grid grid-cols-1 sm:grid-cols-6 gap-3 items-end"
+                  >
+                    <div className="sm:col-span-2">
+                      <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                        Quadra / Local
+                      </label>
+                      <input
+                        required
+                        value={editGroupLocation}
+                        onChange={(e) => setEditGroupLocation(e.target.value)}
+                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs"
+                      />
+                    </div>
+                    <div className="sm:col-span-2">
+                      <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                        Endereço completo
+                      </label>
+                      <input
+                        value={editGroupFullAddress}
+                        onChange={(e) => setEditGroupFullAddress(e.target.value)}
+                        placeholder="Rua, número, bairro, cidade"
+                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs"
+                      />
+                    </div>
+                    <div className="sm:col-span-1">
+                      <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                        Avulso (R$)
+                      </label>
+                      <input
+                        type="number"
+                        step="0.50"
+                        min={0}
+                        value={editGroupAvulsoFee}
+                        onChange={(e) => setEditGroupAvulsoFee(e.target.value)}
+                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs tabular-nums"
+                      />
+                    </div>
+                    <div className="sm:col-span-1 flex justify-end">
+                      <button
+                        type="submit"
+                        disabled={savingGroupInfo}
+                        className="w-full rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-60 cursor-pointer"
+                      >
+                        {savingGroupInfo ? 'Salvando...' : 'Salvar'}
+                      </button>
+                    </div>
+                  </form>
+                )}
+
+                {/* Convida Peladeiro (admin ou peladeiro cadastrado na pelada) */}
+                <div className="rounded-lg border border-emerald-200/80 bg-emerald-50/50 p-3.5 space-y-3">
+                  <form
+                    onSubmit={handleInvitePlayerToGroup}
+                    className="flex flex-col lg:flex-row lg:items-end gap-3"
+                  >
+                    <div className="flex-1 min-w-0">
+                      <label
+                        htmlFor="convida-peladeiro-email"
+                        className="flex items-center gap-1.5 text-xs font-bold text-slate-800 mb-1"
+                      >
+                        <Mail className="h-3.5 w-3.5 text-emerald-700" />
+                        Convida Peladeiro
+                      </label>
+                      <input
+                        id="convida-peladeiro-email"
+                        type="email"
+                        required
+                        value={inviteGuestEmail}
+                        onChange={(e) => setInviteGuestEmail(e.target.value)}
+                        placeholder="Digite o e-mail do convidado para enviar o convite da pelada..."
+                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs sm:text-sm"
+                      />
+                    </div>
+
+                    <div className="w-full lg:w-36">
+                      <label
+                        htmlFor="convida-peladeiro-avulso"
+                        className="block text-[11px] font-semibold text-slate-700 mb-1"
+                      >
+                        Valor do avulso (R$)
+                      </label>
+                      <input
+                        id="convida-peladeiro-avulso"
+                        type="number"
+                        step="0.50"
+                        min={0}
+                        value={inviteGuestAvulsoFee}
+                        onChange={(e) => setInviteGuestAvulsoFee(e.target.value)}
+                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs sm:text-sm tabular-nums"
+                      />
+                    </div>
+
+                    <button
+                      type="submit"
+                      disabled={sendingGroupInvite}
+                      className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-emerald-600 px-4 py-2 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-60 cursor-pointer whitespace-nowrap"
+                    >
+                      <Send className="h-3.5 w-3.5" />
+                      {sendingGroupInvite ? 'Gerando e-mail...' : 'Gerar E-mail de Convite'}
+                    </button>
+                  </form>
+
+                  {generatedGroupInvite && (
+                    <div className="rounded-lg border border-emerald-200 bg-white p-3.5 space-y-2.5">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="text-xs">
+                          <span className="font-bold text-emerald-800">
+                            E-mail de convite gerado para {generatedGroupInvite.toEmail}
+                          </span>
+                          <p className="text-[11px] text-slate-500 mt-0.5">
+                            Assunto: {generatedGroupInvite.subject}
+                          </p>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const fullEmailText = `Assunto: ${generatedGroupInvite.subject}\n\n${generatedGroupInvite.bodyText}`;
+                              navigator.clipboard?.writeText(fullEmailText).catch(() => {});
+                              setCopiedGroupInvite(true);
+                            }}
+                            className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-700 hover:bg-slate-50 cursor-pointer"
+                          >
+                            {copiedGroupInvite ? (
+                              <>
+                                <Check className="h-3 w-3 text-emerald-600" /> Copiado
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="h-3 w-3" /> Copiar e-mail
+                              </>
+                            )}
+                          </button>
+                          <a
+                            href={`mailto:${encodeURIComponent(generatedGroupInvite.toEmail)}?subject=${encodeURIComponent(generatedGroupInvite.subject)}&body=${encodeURIComponent(generatedGroupInvite.bodyText)}`}
+                            className="inline-flex items-center gap-1 rounded-md bg-slate-900 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-slate-800"
+                          >
+                            <Mail className="h-3 w-3" /> Abrir no aplicativo de e-mail
+                          </a>
+                          <button
+                            type="button"
+                            onClick={() => setGeneratedGroupInvite(null)}
+                            className="text-[11px] text-slate-500 hover:text-slate-800 px-1.5 cursor-pointer"
+                          >
+                            Fechar
+                          </button>
+                        </div>
+                      </div>
+                      <pre className="whitespace-pre-wrap font-sans text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded-md p-3 leading-relaxed">
+                        {generatedGroupInvite.bodyText}
+                      </pre>
                     </div>
                   )}
                 </div>
@@ -1612,7 +1999,22 @@ export default function App() {
                     <Trophy className="h-3.5 w-3.5" />
                     Temporadas & Ranking
                   </button>
-                  {isAdmin && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSection('finance');
+                      setActivePeladaId(null);
+                    }}
+                    className={`inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold rounded-md transition-colors whitespace-nowrap cursor-pointer ${
+                      section === 'finance'
+                        ? 'bg-white text-slate-900 shadow-sm'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    <Wallet className="h-3.5 w-3.5 text-emerald-700" />
+                    Financeiro
+                  </button>
+                  {isPeladaAdmin && (
                     <button
                       type="button"
                       onClick={() => {
@@ -1637,6 +2039,7 @@ export default function App() {
                 <PeladaWorkspace
                   peladaId={activePeladaId}
                   authUser={authUser}
+                  isGroupAdmin={activeGroup.isGroupAdmin}
                   allPlayers={players}
                   onBack={() => {
                     setActivePeladaId(null);
@@ -1688,7 +2091,7 @@ export default function App() {
                           </select>
                         )}
 
-                        {isAdmin && seasons.length === 0 && (
+                        {isPeladaAdmin && seasons.length === 0 && (
                           <button
                             type="button"
                             onClick={() => setShowNewSeasonInline(true)}
@@ -1698,7 +2101,7 @@ export default function App() {
                           </button>
                         )}
 
-                        {isAdmin && activeSeason?.status === 'open' && (
+                        {isPeladaAdmin && activeSeason?.status === 'open' && (
                           <button
                             type="button"
                             onClick={() => setShowNewPeladaForm((v) => !v)}
@@ -1743,7 +2146,7 @@ export default function App() {
                     </div>
                   </div>
 
-                  {showNewSeasonInline && isAdmin && (
+                  {showNewSeasonInline && isPeladaAdmin && (
                     <form
                       onSubmit={handleCreateQuickSeason}
                       className="rounded-xl border border-amber-200 bg-amber-50 p-5 flex flex-wrap items-end gap-3"
@@ -1769,7 +2172,7 @@ export default function App() {
                     </form>
                   )}
 
-                  {showNewPeladaForm && isAdmin && (
+                  {showNewPeladaForm && isPeladaAdmin && (
                     <form
                       onSubmit={handleCreatePelada}
                       className="rounded-xl border border-slate-200 bg-white p-6 space-y-4"
@@ -1890,7 +2293,7 @@ export default function App() {
                       <p className="text-sm text-slate-500 max-w-md mx-auto">
                         {!activeSeason
                           ? 'Primeiro abra uma temporada para organizar os encontros desta pelada.'
-                          : isAdmin
+                          : isPeladaAdmin
                             ? 'Cadastre o primeiro encontro (dia de jogo) para confirmar presenças, separar times e registrar gols.'
                             : 'O administrador ainda não cadastrou o próximo encontro.'}
                       </p>
@@ -1998,7 +2401,7 @@ export default function App() {
                     </div>
                   </div>
 
-                  {isAdmin && availableExistingPlayers.length > 0 && (
+                  {isPeladaAdmin && availableExistingPlayers.length > 0 && (
                     <form
                       onSubmit={handleAddExistingPlayerToGroup}
                       className="rounded-xl border border-slate-200 bg-white p-4 flex flex-wrap items-end gap-3"
@@ -2280,7 +2683,7 @@ export default function App() {
                 <SeasonsAndStatsView
                   seasons={seasons}
                   selectedSeasonId={selectedSeasonId}
-                  isAdmin={isAdmin}
+                  isAdmin={isPeladaAdmin}
                   groupId={activeGroup.id}
                   groupName={activeGroup.name}
                   onSelectSeason={(id) => setSelectedSeasonId(id)}
@@ -2289,10 +2692,17 @@ export default function App() {
                   }}
                   onOpenPlayerDetail={(pId) => setDetailPlayerId(pId)}
                 />
-              ) : section === 'access' && isAdmin ? (
+              ) : section === 'finance' ? (
+                <PeladaFinanceView
+                  groupId={activeGroup.id}
+                  players={players}
+                  onGroupUpdated={() => loadGroups()}
+                />
+              ) : section === 'access' && isPeladaAdmin ? (
                 <AdminAccessView
                   groupId={activeGroup.id}
                   groupName={activeGroup.name}
+                  isGlobalAdmin={isAdmin}
                   players={players}
                   allPlayers={allSystemPlayers}
                   pendingJoinRequestsCount={activeGroup.pendingJoinRequestsCount ?? 0}
@@ -2308,6 +2718,9 @@ export default function App() {
                   }}
                   onTestInviteLink={(tok) => {
                     handleLogout().then(() => setInviteToken(tok));
+                  }}
+                  onTestResetLink={(tok) => {
+                    handleLogout().then(() => setResetToken(tok));
                   }}
                 />
               ) : null}
@@ -2380,7 +2793,19 @@ export default function App() {
             >
               <Trophy className="h-4 w-4 mb-0.5" /> Ranking
             </button>
-            {isAdmin && (
+            <button
+              type="button"
+              onClick={() => {
+                setSection('finance');
+                setActivePeladaId(null);
+              }}
+              className={`flex flex-col items-center text-[11px] font-semibold ${
+                section === 'finance' ? 'text-emerald-700' : 'text-slate-500'
+              }`}
+            >
+              <Wallet className="h-4 w-4 mb-0.5" /> Caixa
+            </button>
+            {isPeladaAdmin && (
               <button
                 type="button"
                 onClick={() => {

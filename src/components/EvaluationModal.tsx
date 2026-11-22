@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { CheckCircle2, X } from 'lucide-react';
+import { CheckCircle2, Minus, Plus, X } from 'lucide-react';
 import { apiFetch } from '../lib/api';
 import {
   DEFAULT_GROUP_CRITERIA,
@@ -143,6 +143,14 @@ export function EvaluationModal({
     }
   }
 
+  function updateCriterionScore(key: string, nextValue: number) {
+    const clamped = Math.max(1, Math.min(10, Math.round(nextValue * 2) / 2));
+    setScores((prev) => ({
+      ...prev,
+      [key]: clamped,
+    }));
+  }
+
   const totalWeight = displayCriteria.reduce((acc, c) => acc + c.weight, 0);
   const avg =
     totalWeight > 0
@@ -194,7 +202,8 @@ export function EvaluationModal({
               Avaliar Desempenho — Jogo #{match.matchNumber}
             </h3>
             <p className="text-xs text-slate-500">
-              Notas de 1 a 10 nos {displayCriteria.length} critérios configurados da pelada.
+              Notas de 1 a 10 (passo de 0,5) nos {displayCriteria.length} critérios configurados da
+              pelada.
             </p>
           </div>
           <button
@@ -288,23 +297,38 @@ export function EvaluationModal({
                             )}
                           </span>
                           <span className="font-mono tabular-nums font-bold text-slate-900">
-                            {val}
+                            {val.toFixed(1)}
                           </span>
                         </div>
-                        <input
-                          type="range"
-                          min={1}
-                          max={10}
-                          step={1}
-                          value={val}
-                          onChange={(e) =>
-                            setScores((prev) => ({
-                              ...prev,
-                              [c.key]: Number(e.target.value),
-                            }))
-                          }
-                          className="w-full accent-emerald-600 cursor-pointer"
-                        />
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => updateCriterionScore(c.key, val - 0.5)}
+                            disabled={val <= 1}
+                            aria-label={`Diminuir ${c.label}`}
+                            className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40 cursor-pointer"
+                          >
+                            <Minus className="h-3.5 w-3.5" />
+                          </button>
+                          <input
+                            type="range"
+                            min={1}
+                            max={10}
+                            step={0.5}
+                            value={val}
+                            onChange={(e) => updateCriterionScore(c.key, Number(e.target.value))}
+                            className="w-full accent-emerald-600 cursor-pointer"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => updateCriterionScore(c.key, val + 0.5)}
+                            disabled={val >= 10}
+                            aria-label={`Aumentar ${c.label}`}
+                            className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40 cursor-pointer"
+                          >
+                            <Plus className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
                       </div>
                     );
                   })}

@@ -12,6 +12,7 @@ import {
   Trash2,
   Trophy,
   Users,
+  Wallet,
 } from 'lucide-react';
 import { apiFetch } from '../lib/api';
 import type {
@@ -26,6 +27,7 @@ import type {
   PlayerCategory,
 } from '../types/futsal';
 import { EvaluationModal } from './EvaluationModal';
+import { PeladaFinanceView } from './PeladaFinanceView';
 import { PlayerAvatar } from './PlayerAvatar';
 
 const CATEGORY_PRIORITY: Record<PlayerCategory, number> = {
@@ -52,6 +54,7 @@ interface PeladaDetailResponse {
 interface PeladaWorkspaceProps {
   peladaId: number;
   authUser: AuthUser;
+  isGroupAdmin?: boolean;
   allPlayers: Player[];
   onBack: () => void;
   onRefreshPlayers: () => void;
@@ -60,16 +63,18 @@ interface PeladaWorkspaceProps {
 export function PeladaWorkspace({
   peladaId,
   authUser,
+  isGroupAdmin = false,
   allPlayers,
   onBack,
   onRefreshPlayers,
 }: PeladaWorkspaceProps) {
-  const isAdmin = authUser.role === 'admin';
+  const isAdmin = authUser.role === 'admin' || isGroupAdmin;
 
   const [detail, setDetail] = useState<PeladaDetailResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [tab, setTab] = useState<'matches' | 'teams' | 'stats'>('matches');
+  const [financeBanner, setFinanceBanner] = useState<string | null>(null);
+  const [tab, setTab] = useState<'matches' | 'teams' | 'stats' | 'finance'>('matches');
 
   // New match form
   const [teamAId, setTeamAId] = useState<number>(0);
@@ -336,12 +341,36 @@ export function PeladaWorkspace({
   async function handleTogglePeladaStatus() {
     setBusy(true);
     setError(null);
+    setFinanceBanner(null);
     try {
       const nextStatus = pelada.status === 'finished' ? 'in_progress' : 'finished';
-      await apiFetch(`/api/peladas/${peladaId}/status`, {
+      const res = await apiFetch<{
+        financeNotification?: {
+          emailsSent?: number;
+          chargesCreated?: number;
+          skippedNoPix?: boolean;
+          skippedNoEmail?: string[];
+        } | null;
+      }>(`/api/peladas/${peladaId}/status`, {
         method: 'PATCH',
         body: JSON.stringify({ status: nextStatus }),
       });
+      if (nextStatus === 'finished' && res.financeNotification) {
+        const fn = res.financeNotification;
+        if (fn.skippedNoPix) {
+          setFinanceBanner(
+            'Pelada encerrada! Configure a chave PIX na aba Financeiro para gerar e enviar automaticamente os e-mails de cobrança aos inadimplentes.'
+          );
+        } else if ((fn.emailsSent ?? 0) > 0) {
+          setFinanceBanner(
+            `Pelada encerrada! ${fn.emailsSent} e-mail(s) de cobrança com chave PIX foram enviados aos participantes pendentes (confira na aba Financeiro).`
+          );
+        } else {
+          setFinanceBanner(
+            'Pelada encerrada! Todos os participantes com e-mail cadastrado já estão com mensalidade/diária em dia.'
+          );
+        }
+      }
       await loadDetail();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Erro ao alterar status da pelada.');
@@ -412,7 +441,22 @@ export function PeladaWorkspace({
         </div>
       )}
 
-      <div className="inline-flex items-center gap-1 rounded-lg bg-slate-100 p-1">
+      {financeBanner && (
+        <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 flex flex-wrap items-center justify-between gap-2 text-sm text-emerald-900">
+          <span>{financeBanner}</span>
+          {pelada.groupId != null && (
+            <button
+              type="button"
+              onClick={() => setTab('finance')}
+              className="rounded-md bg-emerald-700 px-3 py-1 text-xs font-semibold text-white hover:bg-emerald-800 cursor-pointer"
+            >
+              Abrir Financeiro
+            </button>
+          )}
+        </div>
+      )}
+
+      <div className="inline-flex flex-wrap items-center gap-1 rounded-lg bg-slate-100 p-1">
         <button
           type="button"
           onClick={() => setTab('matches')}
@@ -446,6 +490,20 @@ export function PeladaWorkspace({
         >
           Estatísticas da Pelada
         </button>
+        {pelada.groupId != null && (
+          <button
+            type="button"
+            onClick={() => setTab('finance')}
+            className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+              tab === 'finance'
+                ? 'bg-white text-slate-900 shadow-sm'
+                : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            <Wallet className="h-3.5 w-3.5 text-emerald-700" />
+            Financeiro
+          </button>
+        )}
       </div>
 
       {tab === 'matches' && (
@@ -1240,6 +1298,15 @@ export function PeladaWorkspace({
             </div>
           </div>
         </div>
+      )}
+
+      {tab === 'finance' && pelada.groupId != null && (
+        <PeladaFinanceView
+          groupId={pelada.groupId}
+          players={allPlayers}
+          scopedPeladaId={pelada.id}
+          scopedPeladaTitle={pelada.title}
+        />
       )}
 
       {evaluatingMatch && (

@@ -71,6 +71,11 @@ export const peladaGroups = pgTable('pelada_groups', {
   weekday: text('weekday').notNull().default('Quarta-feira'),
   startTime: text('start_time').notNull().default('20:00'),
   location: text('location').notNull().default('Quadra Principal'),
+  fullAddress: text('full_address'),
+  avulsoFee: doublePrecision('avulso_fee').notNull().default(0),
+  monthlyFee: doublePrecision('monthly_fee').notNull().default(0),
+  initialCashBalance: doublePrecision('initial_cash_balance').notNull().default(0),
+  pixKey: text('pix_key'),
   playersPerTeam: integer('players_per_team').notNull().default(5),
   defaultTeamsCount: integer('default_teams_count').notNull().default(2),
   photoUrl: text('photo_url'),
@@ -89,6 +94,7 @@ export const peladaGroupMembers = pgTable(
     userId: integer('user_id').references(() => users.id, { onDelete: 'cascade' }),
     playerId: integer('player_id').references(() => players.id, { onDelete: 'cascade' }),
     memberRole: text('member_role').notNull().default('member'), // 'admin' | 'member'
+    adminTitle: text('admin_title'), // 'presidente' | 'tesoureiro' | 'presidente_tesoureiro' | 'administrador' | null
     playerCategory: text('player_category').notNull().default('mensalista'), // 'mensalista' | 'avulso' | 'eventual'
     accessPeladaId: integer('access_pelada_id').references(() => peladas.id, { onDelete: 'set null' }),
     accessExpiresAt: timestamp('access_expires_at'),
@@ -356,10 +362,100 @@ export const inviteEmails = pgTable('invite_emails', {
     .references(() => users.id, { onDelete: 'cascade' })
     .notNull(),
   playerId: integer('player_id').references(() => players.id, { onDelete: 'set null' }),
+  groupId: integer('group_id').references(() => peladaGroups.id, { onDelete: 'set null' }),
+  invitedByUserId: integer('invited_by_user_id').references(() => users.id, { onDelete: 'set null' }),
+  avulsoFee: doublePrecision('avulso_fee'),
   toEmail: text('to_email').notNull(),
   subject: text('subject').notNull(),
   bodyText: text('body_text').notNull(),
   inviteLink: text('invite_link').notNull(),
+  status: text('status').notNull().default('sent'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+export const peladaFinanceEntries = pgTable('pelada_finance_entries', {
+  id: serial('id').primaryKey(),
+  groupId: integer('group_id')
+    .references(() => peladaGroups.id, { onDelete: 'cascade' })
+    .notNull(),
+  peladaId: integer('pelada_id').references(() => peladas.id, { onDelete: 'set null' }),
+  entryType: text('entry_type').notNull(), // 'cash_box' | 'income' | 'expense' | 'pending_debt'
+  title: text('title').notNull(),
+  description: text('description'),
+  amount: doublePrecision('amount').notNull().default(0),
+  status: text('status').notNull().default('settled'), // 'settled' | 'pending'
+  attachmentUrl: text('attachment_url'),
+  entryDate: text('entry_date').notNull(),
+  createdByUserId: integer('created_by_user_id').references(() => users.id, { onDelete: 'set null' }),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+export const peladaParticipantPayments = pgTable('pelada_participant_payments', {
+  id: serial('id').primaryKey(),
+  groupId: integer('group_id')
+    .references(() => peladaGroups.id, { onDelete: 'cascade' })
+    .notNull(),
+  peladaId: integer('pelada_id').references(() => peladas.id, { onDelete: 'set null' }),
+  playerId: integer('player_id')
+    .references(() => players.id, { onDelete: 'cascade' })
+    .notNull(),
+  userId: integer('user_id').references(() => users.id, { onDelete: 'set null' }),
+  paymentType: text('payment_type').notNull().default('diaria'), // 'mensalidade' | 'diaria'
+  referenceLabel: text('reference_label').notNull(),
+  amount: doublePrecision('amount').notNull().default(0),
+  status: text('status').notNull().default('pending'), // 'pending' | 'paid'
+  paidAt: timestamp('paid_at'),
+  confirmedByUserId: integer('confirmed_by_user_id').references(() => users.id, { onDelete: 'set null' }),
+  confirmedByRole: text('confirmed_by_role'),
+  notes: text('notes'),
+  attachmentUrl: text('attachment_url'),
+  pixEmailSentAt: timestamp('pix_email_sent_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+export const peladaPixPaymentEmails = pgTable('pelada_pix_payment_emails', {
+  id: serial('id').primaryKey(),
+  groupId: integer('group_id')
+    .references(() => peladaGroups.id, { onDelete: 'cascade' })
+    .notNull(),
+  peladaId: integer('pelada_id').references(() => peladas.id, { onDelete: 'set null' }),
+  paymentId: integer('payment_id').references(() => peladaParticipantPayments.id, {
+    onDelete: 'cascade',
+  }),
+  userId: integer('user_id').references(() => users.id, { onDelete: 'cascade' }),
+  playerId: integer('player_id')
+    .references(() => players.id, { onDelete: 'cascade' })
+    .notNull(),
+  toEmail: text('to_email').notNull(),
+  subject: text('subject').notNull(),
+  bodyText: text('body_text').notNull(),
+  pixKey: text('pix_key').notNull(),
+  amount: doublePrecision('amount').notNull(),
+  status: text('status').notNull().default('sent'),
+  sentAt: timestamp('sent_at').defaultNow().notNull(),
+});
+
+export const passwordResetTokens = pgTable('password_reset_tokens', {
+  id: serial('id').primaryKey(),
+  userId: integer('user_id')
+    .references(() => users.id, { onDelete: 'cascade' })
+    .notNull(),
+  email: text('email').notNull(),
+  tokenHash: text('token_hash').notNull().unique(),
+  expiresAt: timestamp('expires_at').notNull(),
+  usedAt: timestamp('used_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+export const passwordResetEmails = pgTable('password_reset_emails', {
+  id: serial('id').primaryKey(),
+  userId: integer('user_id')
+    .references(() => users.id, { onDelete: 'cascade' })
+    .notNull(),
+  toEmail: text('to_email').notNull(),
+  subject: text('subject').notNull(),
+  bodyText: text('body_text').notNull(),
+  resetLink: text('reset_link').notNull(),
   status: text('status').notNull().default('sent'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });

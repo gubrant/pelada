@@ -14,36 +14,50 @@ import {
 } from 'lucide-react';
 import { apiFetch } from '../lib/api';
 import type {
+  AdminTitle,
   AdminUserAccount,
   InviteEmailRecord,
+  PasswordResetEmailRecord,
   PeladaGroupMember,
   Player,
   PlayerSummaryEmailRecord,
 } from '../types/futsal';
 
+const ADMIN_TITLE_OPTIONS: Array<{ value: AdminTitle; label: string }> = [
+  { value: 'presidente_tesoureiro', label: 'Presidente e Tesoureiro' },
+  { value: 'presidente', label: 'Presidente' },
+  { value: 'tesoureiro', label: 'Tesoureiro' },
+  { value: 'administrador', label: 'Admin comum (sem baixa financeira)' },
+];
+
 interface AdminAccessViewProps {
   groupId?: number | null;
   groupName?: string;
+  isGlobalAdmin?: boolean;
   players: Player[];
   allPlayers?: Player[];
   pendingJoinRequestsCount?: number;
   onOpenJoinRequests?: () => void;
   onMembersChanged?: () => void;
   onTestInviteLink: (token: string) => void;
+  onTestResetLink?: (token: string) => void;
 }
 
 export function AdminAccessView({
   groupId,
   groupName,
+  isGlobalAdmin = true,
   players,
   allPlayers = [],
   pendingJoinRequestsCount = 0,
   onOpenJoinRequests,
   onMembersChanged,
   onTestInviteLink,
+  onTestResetLink,
 }: AdminAccessViewProps) {
   const [users, setUsers] = useState<AdminUserAccount[]>([]);
   const [invites, setInvites] = useState<InviteEmailRecord[]>([]);
+  const [passwordResets, setPasswordResets] = useState<PasswordResetEmailRecord[]>([]);
   const [members, setMembers] = useState<PeladaGroupMember[]>([]);
   const [summaryEmails, setSummaryEmails] = useState<PlayerSummaryEmailRecord[]>([]);
   const [selectedAddPlayerId, setSelectedAddPlayerId] = useState<number>(0);
@@ -65,9 +79,18 @@ export function AdminAccessView({
   const loadData = useCallback(async () => {
     setLoading(true);
     try {
-      const [uRes, iRes, mRes, sRes] = await Promise.all([
-        apiFetch<AdminUserAccount[]>('/api/admin/users'),
-        apiFetch<InviteEmailRecord[]>('/api/admin/invites'),
+      const [uRes, iRes, prRes, mRes, sRes] = await Promise.all([
+        isGlobalAdmin
+          ? apiFetch<AdminUserAccount[]>('/api/admin/users').catch(() => [] as AdminUserAccount[])
+          : Promise.resolve([] as AdminUserAccount[]),
+        isGlobalAdmin
+          ? apiFetch<InviteEmailRecord[]>('/api/admin/invites').catch(() => [] as InviteEmailRecord[])
+          : Promise.resolve([] as InviteEmailRecord[]),
+        isGlobalAdmin
+          ? apiFetch<PasswordResetEmailRecord[]>('/api/admin/password-resets').catch(
+              () => [] as PasswordResetEmailRecord[]
+            )
+          : Promise.resolve([] as PasswordResetEmailRecord[]),
         groupId
           ? apiFetch<PeladaGroupMember[]>(`/api/groups/${groupId}/members`)
           : Promise.resolve([] as PeladaGroupMember[]),
@@ -79,6 +102,7 @@ export function AdminAccessView({
       ]);
       setUsers(uRes);
       setInvites(iRes);
+      setPasswordResets(prRes);
       setMembers(mRes);
       setSummaryEmails(sRes);
     } catch (err: unknown) {
@@ -86,7 +110,7 @@ export function AdminAccessView({
     } finally {
       setLoading(false);
     }
-  }, [groupId]);
+  }, [groupId, isGlobalAdmin]);
 
   useEffect(() => {
     loadData();
@@ -142,17 +166,43 @@ export function AdminAccessView({
     try {
       await apiFetch(`/api/groups/${groupId}/members/${m.id}`, {
         method: 'PATCH',
-        body: JSON.stringify({ memberRole: nextRole }),
+        body: JSON.stringify({
+          memberRole: nextRole,
+          ...(nextRole === 'admin' ? { adminTitle: m.adminTitle ?? 'administrador' } : {}),
+        }),
       });
       setSuccess(
         nextRole === 'admin'
-          ? `${m.playerNickname || m.userName || 'Participante'} agora é Administrador desta pelada (receberá notificações e poderá votar).`
+          ? `${m.playerNickname || m.userName || 'Participante'} agora é Administrador desta pelada (defina ao lado se atua como Presidente ou Tesoureiro).`
           : `${m.playerNickname || m.userName || 'Participante'} alterado para Peladeiro.`
       );
       await loadData();
       onMembersChanged?.();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Erro ao alterar função do participante.');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleChangeAdminTitle(m: PeladaGroupMember, adminTitle: AdminTitle) {
+    if (!groupId) return;
+    setSaving(true);
+    setError(null);
+    setSuccess(null);
+    try {
+      await apiFetch(`/api/groups/${groupId}/members/${m.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ memberRole: 'admin', adminTitle }),
+      });
+      const label = ADMIN_TITLE_OPTIONS.find((opt) => opt.value === adminTitle)?.label ?? adminTitle;
+      setSuccess(
+        `Função administrativa de ${m.playerNickname || m.userName || 'Admin'} atualizada para ${label}.`
+      );
+      await loadData();
+      onMembersChanged?.();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Erro ao atualizar função administrativa.');
     } finally {
       setSaving(false);
     }
@@ -216,19 +266,19 @@ export function AdminAccessView({
     }
   }
 
-  function extractToken(link: string): string | null {
+  function extractToken(link: string, param = 'convite'): string | null {
     try {
       const url = new URL(link);
-      return url.searchParams.get('convite');
+      return url.searchParams.get(param);
     } catch {
       return null;
     }
   }
 
-  async function copyLink(inv: InviteEmailRecord) {
+  async function copyLink(idKey: number, text: string) {
     try {
-      await navigator.clipboard.writeText(inv.inviteLink);
-      setCopiedId(inv.id);
+      await navigator.clipboard.writeText(text);
+      setCopiedId(idKey);
       setTimeout(() => setCopiedId(null), 2000);
     } catch {
       setError('Não foi possível copiar automaticamente. Selecione o link manualmente.');
@@ -283,8 +333,14 @@ export function AdminAccessView({
             )}
           </div>
 
+          <div className="rounded-lg border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-xs text-slate-600">
+            <strong className="text-slate-800">Regra financeira:</strong> somente administradores
+            com função de <strong>Presidente</strong> e/ou <strong>Tesoureiro</strong> podem
+            confirmar recebimento de mensalidades e diárias no Controle Financeiro.
+          </div>
+
           <form onSubmit={handleAddMember} className="grid grid-cols-1 sm:grid-cols-12 gap-3 items-end">
-            <div className="sm:col-span-5">
+            <div className={isGlobalAdmin ? 'sm:col-span-5' : 'sm:col-span-9'}>
               <label className="block text-xs font-semibold text-slate-700 mb-1">
                 Adicionar Peladeiro Cadastrado
               </label>
@@ -307,28 +363,30 @@ export function AdminAccessView({
               </select>
             </div>
 
-            <div className="sm:col-span-4">
-              <label className="block text-xs font-semibold text-slate-700 mb-1">
-                Ou adicionar Conta de Usuário
-              </label>
-              <select
-                value={selectedAddUserId}
-                onChange={(e) => {
-                  setSelectedAddUserId(Number(e.target.value));
-                  setSelectedAddPlayerId(0);
-                }}
-                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm bg-white"
-              >
-                <option value={0}>Selecione um usuário...</option>
-                {users
-                  .filter((u) => !members.some((m) => m.userId === u.id))
-                  .map((u) => (
-                    <option key={u.id} value={u.id}>
-                      {u.name} ({u.email})
-                    </option>
-                  ))}
-              </select>
-            </div>
+            {isGlobalAdmin && (
+              <div className="sm:col-span-4">
+                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  Ou adicionar Conta de Usuário
+                </label>
+                <select
+                  value={selectedAddUserId}
+                  onChange={(e) => {
+                    setSelectedAddUserId(Number(e.target.value));
+                    setSelectedAddPlayerId(0);
+                  }}
+                  className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm bg-white"
+                >
+                  <option value={0}>Selecione um usuário...</option>
+                  {users
+                    .filter((u) => !members.some((m) => m.userId === u.id))
+                    .map((u) => (
+                      <option key={u.id} value={u.id}>
+                        {u.name} ({u.email})
+                      </option>
+                    ))}
+                </select>
+              </div>
+            )}
 
             <div className="sm:col-span-3">
               <button
@@ -347,103 +405,136 @@ export function AdminAccessView({
                 const isEventual = m.playerCategory === 'eventual';
                 const expDate = m.accessExpiresAt ? new Date(m.accessExpiresAt) : null;
                 const isExpired = isEventual && expDate != null && new Date() > expDate;
+                const currentTitle: AdminTitle = m.adminTitle ?? 'administrador';
+                const titleBadge =
+                  currentTitle === 'presidente_tesoureiro'
+                    ? 'Presidente e Tesoureiro'
+                    : currentTitle === 'presidente'
+                      ? 'Presidente'
+                      : currentTitle === 'tesoureiro'
+                        ? 'Tesoureiro'
+                        : 'Admin comum';
                 return (
                   <div
                     key={m.id}
-                    className="flex items-center justify-between gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs"
+                    className="flex flex-col justify-between gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-xs"
                   >
-                    <div className="min-w-0">
-                      <p className="font-semibold text-slate-900 truncate">
-                        {m.playerNickname || m.userName || 'Participante'}
-                      </p>
-                      <p className="text-[11px] text-slate-500 truncate">
-                        {m.memberRole === 'admin'
-                          ? 'Admin da Pelada'
-                          : m.playerCategory === 'avulso'
-                            ? 'Avulso'
-                            : m.playerCategory === 'eventual'
-                              ? 'Eventual'
-                              : 'Mensalista'}
-                        {m.userEmail ? ` · ${m.userEmail}` : ''}
-                      </p>
-                      {isEventual && expDate && (
-                        <p
-                          className={`text-[10px] font-medium flex items-center gap-1 mt-0.5 ${
-                            isExpired ? 'text-red-600' : 'text-amber-700'
-                          }`}
-                        >
-                          <Clock className="h-3 w-3 shrink-0" />
-                          {isExpired
-                            ? `Encerrado em ${expDate.toLocaleDateString('pt-BR')}`
-                            : `Acesso até ${expDate.toLocaleDateString('pt-BR')}`}
-                          {m.summaryEmailSentAt ? ' · Resumo enviado' : ''}
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <p className="font-semibold text-slate-900 truncate">
+                          {m.playerNickname || m.userName || 'Participante'}
                         </p>
-                      )}
-                    </div>
-                    <div className="flex items-center gap-1 shrink-0">
-                      {isEventual && !m.summaryEmailSentAt && groupId && (
-                        <button
-                          type="button"
-                          disabled={saving}
-                          onClick={async () => {
-                            setSaving(true);
-                            setError(null);
-                            try {
-                              await apiFetch(`/api/groups/${groupId}/process-eventual-emails`, {
-                                method: 'POST',
-                                body: JSON.stringify({ memberId: m.id }),
-                              });
-                              setSuccess(
-                                `E-mail de agradecimento e estatísticas enviado para ${
-                                  m.playerNickname || m.userName || 'eventual'
-                                }.`
-                              );
-                              await loadData();
-                              onMembersChanged?.();
-                            } catch (err: unknown) {
-                              setError(
-                                err instanceof Error ? err.message : 'Erro ao enviar resumo.'
-                              );
-                            } finally {
-                              setSaving(false);
+                        <p className="text-[11px] text-slate-500 truncate">
+                          {m.memberRole === 'admin'
+                            ? titleBadge
+                            : m.playerCategory === 'avulso'
+                              ? 'Avulso'
+                              : m.playerCategory === 'eventual'
+                                ? 'Eventual'
+                                : 'Mensalista'}
+                          {m.userEmail ? ` · ${m.userEmail}` : ''}
+                        </p>
+                        {isEventual && expDate && (
+                          <p
+                            className={`text-[10px] font-medium flex items-center gap-1 mt-0.5 ${
+                              isExpired ? 'text-red-600' : 'text-amber-700'
+                            }`}
+                          >
+                            <Clock className="h-3 w-3 shrink-0" />
+                            {isExpired
+                              ? `Encerrado em ${expDate.toLocaleDateString('pt-BR')}`
+                              : `Acesso até ${expDate.toLocaleDateString('pt-BR')}`}
+                            {m.summaryEmailSentAt ? ' · Resumo enviado' : ''}
+                          </p>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-1 shrink-0">
+                        {isEventual && !m.summaryEmailSentAt && groupId && (
+                          <button
+                            type="button"
+                            disabled={saving}
+                            onClick={async () => {
+                              setSaving(true);
+                              setError(null);
+                              try {
+                                await apiFetch(`/api/groups/${groupId}/process-eventual-emails`, {
+                                  method: 'POST',
+                                  body: JSON.stringify({ memberId: m.id }),
+                                });
+                                setSuccess(
+                                  `E-mail de agradecimento e estatísticas enviado para ${
+                                    m.playerNickname || m.userName || 'eventual'
+                                  }.`
+                                );
+                                await loadData();
+                                onMembersChanged?.();
+                              } catch (err: unknown) {
+                                setError(
+                                  err instanceof Error ? err.message : 'Erro ao enviar resumo.'
+                                );
+                              } finally {
+                                setSaving(false);
+                              }
+                            }}
+                            className="rounded border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-800 hover:bg-amber-100 cursor-pointer"
+                            title="Encerrar período eventual e enviar e-mail com resumo de estatísticas"
+                          >
+                            Enviar Resumo
+                          </button>
+                        )}
+                        {m.userId != null && (
+                          <button
+                            type="button"
+                            disabled={saving}
+                            onClick={() => handleToggleMemberRole(m)}
+                            className={`rounded border px-2 py-0.5 text-[11px] font-semibold cursor-pointer ${
+                              m.memberRole === 'admin'
+                                ? 'border-emerald-200 bg-emerald-50 text-emerald-800 hover:bg-emerald-100'
+                                : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-100'
+                            }`}
+                            title={
+                              m.memberRole === 'admin'
+                                ? 'Remover privilégio de admin da pelada'
+                                : 'Tornar administrador desta pelada para votar e configurar critérios'
                             }
-                          }}
-                          className="rounded border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-800 hover:bg-amber-100 cursor-pointer"
-                          title="Encerrar período eventual e enviar e-mail com resumo de estatísticas"
-                        >
-                          Enviar Resumo
-                        </button>
-                      )}
-                      {m.userId != null && (
-                        <button
-                          type="button"
-                          disabled={saving}
-                          onClick={() => handleToggleMemberRole(m)}
-                          className={`rounded border px-2 py-0.5 text-[11px] font-semibold cursor-pointer ${
-                            m.memberRole === 'admin'
-                              ? 'border-emerald-200 bg-emerald-50 text-emerald-800 hover:bg-emerald-100'
-                              : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-100'
-                          }`}
-                          title={
-                            m.memberRole === 'admin'
-                              ? 'Remover privilégio de admin da pelada'
-                              : 'Tornar administrador desta pelada para votar e configurar critérios'
-                          }
-                        >
-                          {m.memberRole === 'admin' ? 'Admin' : '+ Admin'}
-                        </button>
-                      )}
-                      {m.memberRole !== 'admin' && (
-                        <button
-                          type="button"
-                          onClick={() => handleRemoveMember(m.id)}
-                          className="text-slate-400 hover:text-red-600 p-1 cursor-pointer"
-                          title="Remover da pelada fixa"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
-                      )}
+                          >
+                            {m.memberRole === 'admin' ? 'Admin' : '+ Admin'}
+                          </button>
+                        )}
+                        {m.memberRole !== 'admin' && (
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveMember(m.id)}
+                            className="text-slate-400 hover:text-red-600 p-1 cursor-pointer"
+                            title="Remover da pelada fixa"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        )}
+                      </div>
                     </div>
+
+                    {m.memberRole === 'admin' && (
+                      <div className="pt-1.5 border-t border-slate-200/70">
+                        <label className="block text-[10px] font-semibold text-slate-500 mb-1">
+                          Função na Diretoria / Financeiro
+                        </label>
+                        <select
+                          value={currentTitle}
+                          disabled={saving}
+                          onChange={(e) =>
+                            handleChangeAdminTitle(m, e.target.value as AdminTitle)
+                          }
+                          className="w-full rounded-md border border-slate-300 bg-white px-2 py-1 text-[11px] font-medium text-slate-800"
+                        >
+                          {ADMIN_TITLE_OPTIONS.map((opt) => (
+                            <option key={opt.value} value={opt.value}>
+                              {opt.label}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
                   </div>
                 );
               })}
@@ -452,7 +543,7 @@ export function AdminAccessView({
         </div>
       )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+      {isGlobalAdmin && <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
         <form
           onSubmit={handleCreateAccount}
           className="lg:col-span-5 rounded-xl border border-slate-200 bg-white p-5 space-y-4"
@@ -638,7 +729,7 @@ export function AdminAccessView({
                       <div className="flex flex-wrap items-center gap-2">
                         <button
                           type="button"
-                          onClick={() => copyLink(inv)}
+                          onClick={() => copyLink(inv.id, inv.inviteLink)}
                           className="inline-flex items-center gap-1.5 rounded-md border border-slate-300 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50 cursor-pointer"
                         >
                           {copiedId === inv.id ? (
@@ -664,6 +755,77 @@ export function AdminAccessView({
                             className="inline-flex items-center gap-1.5 rounded-md border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-800 hover:bg-emerald-100 cursor-pointer"
                           >
                             Testar Tela de Registro
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          <div className="rounded-xl border border-slate-200 bg-white overflow-hidden">
+            <div className="px-5 py-3.5 border-b border-slate-200 flex items-center justify-between">
+              <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                <Mail className="h-4 w-4 text-amber-600" />
+                E-mails de Recuperação de Senha ({passwordResets.length})
+              </h3>
+            </div>
+            {passwordResets.length === 0 ? (
+              <div className="p-6 text-center text-xs text-slate-500">
+                Nenhuma solicitação de redefinição de senha registrada.
+              </div>
+            ) : (
+              <div className="divide-y divide-slate-100 max-h-[280px] overflow-y-auto">
+                {passwordResets.map((pr) => {
+                  const token = extractToken(pr.resetLink, 'redefinir');
+                  const mailtoHref = `mailto:${encodeURIComponent(pr.toEmail)}?subject=${encodeURIComponent(pr.subject)}&body=${encodeURIComponent(pr.bodyText)}`;
+                  const resetCopyKey = 100000 + pr.id;
+                  return (
+                    <div key={pr.id} className="p-4 space-y-2">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div>
+                          <p className="text-xs font-bold text-slate-900">{pr.toEmail}</p>
+                          <p className="text-[11px] text-slate-500">
+                            {pr.subject} ·{' '}
+                            {pr.status === 'sent' ? 'Enviado por e-mail' : 'Link gerado para envio'}
+                          </p>
+                        </div>
+                        <span className="text-[11px] font-mono tabular-nums text-slate-400">
+                          {new Date(pr.createdAt).toLocaleDateString('pt-BR')}
+                        </span>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => copyLink(resetCopyKey, pr.resetLink)}
+                          className="inline-flex items-center gap-1.5 rounded-md border border-slate-300 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50 cursor-pointer"
+                        >
+                          {copiedId === resetCopyKey ? (
+                            <>
+                              <Check className="h-3.5 w-3.5 text-emerald-600" /> Copiado
+                            </>
+                          ) : (
+                            <>
+                              <Copy className="h-3.5 w-3.5" /> Copiar Link
+                            </>
+                          )}
+                        </button>
+                        <a
+                          href={mailtoHref}
+                          className="inline-flex items-center gap-1.5 rounded-md border border-slate-300 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                        >
+                          <ExternalLink className="h-3.5 w-3.5" /> Abrir no E-mail
+                        </a>
+                        {token && onTestResetLink && (
+                          <button
+                            type="button"
+                            onClick={() => onTestResetLink(token)}
+                            className="inline-flex items-center gap-1.5 rounded-md border border-amber-200 bg-amber-50 px-2.5 py-1 text-xs font-semibold text-amber-900 hover:bg-amber-100 cursor-pointer"
+                          >
+                            Testar Redefinição
                           </button>
                         )}
                       </div>
@@ -779,7 +941,7 @@ export function AdminAccessView({
             </div>
           )}
         </div>
-      </div>
+      </div>}
     </div>
   );
 }
