@@ -135,6 +135,7 @@ export interface PeladaGroupSummary {
   description: string | null;
   weekday: string;
   startTime: string;
+  endTime: string;
   location: string;
   fullAddress?: string | null;
   avulsoFee?: number | null;
@@ -144,12 +145,12 @@ export interface PeladaGroupSummary {
   playersPerTeam: number;
   defaultTeamsCount: number;
   photoUrl: string | null;
-  ownerUserId: number | null;
-  createdAt: string;
+  ownerUserId?: number | null;
+  createdAt?: string;
   membersCount: number;
   peladasCount: number;
   openSeasonName: string | null;
-  myMemberRole: 'admin' | 'member';
+  myMemberRole?: 'admin' | 'member';
   myAdminTitle?: AdminTitle | null;
   canConfirmPayments?: boolean;
   isGroupAdmin?: boolean;
@@ -174,6 +175,7 @@ export interface PeladaGroupSummary {
     title: string;
     eventDate: string;
     startTime: string;
+    endTime?: string;
     status: string;
   }>;
 }
@@ -197,6 +199,8 @@ export interface PeladaGroupMember {
   summaryEmailSentAt?: string | null;
   userName: string | null;
   userEmail: string | null;
+  userHasPassword?: boolean;
+  canEditCredentials?: boolean;
   playerName: string | null;
   playerNickname: string | null;
   playerPosition: string | null;
@@ -225,9 +229,11 @@ export interface PeladaSummary {
   location: string;
   eventDate: string;
   startTime: string;
+  endTime: string;
   playersPerTeam: number;
   status: 'scheduled' | 'in_progress' | 'finished';
   notes: string | null;
+  criteriaConfig?: GroupCriterion[];
   presentCount: number;
   matchesCount: number;
 }

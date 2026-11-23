@@ -174,6 +174,27 @@ export async function getGroupCriteriaConfig(groupId: number | null | undefined)
   return parseCriteriaConfig(rows[0].criteriaConfig);
 }
 
+export async function getPeladaCriteriaConfig(
+  peladaId: number | null | undefined
+): Promise<GroupCriterion[]> {
+  if (!peladaId || !Number.isInteger(peladaId)) {
+    return DEFAULT_GROUP_CRITERIA.map((c) => ({ ...c }));
+  }
+  const rows = await db
+    .select({
+      criteriaConfig: peladas.criteriaConfig,
+      groupId: peladas.groupId,
+    })
+    .from(peladas)
+    .where(eq(peladas.id, peladaId))
+    .limit(1);
+  if (rows.length === 0) return DEFAULT_GROUP_CRITERIA.map((c) => ({ ...c }));
+  if (rows[0].criteriaConfig) {
+    return parseCriteriaConfig(rows[0].criteriaConfig);
+  }
+  return getGroupCriteriaConfig(rows[0].groupId);
+}
+
 export async function resolvePlayerCriteriaConfig(
   player: typeof players.$inferSelect,
   preferredGroupId?: number | null
@@ -246,11 +267,12 @@ export async function recalculatePlayerRatings(
     const initOverall = computeWeightedOverall(initScores, criteriaConfig);
     const initScoresJson = JSON.stringify(initScores);
 
-    // 2. Check post-match player evaluations (last 10 matches)
+    // 2. Check post-match or encounter player evaluations (last 10 sessions)
     const evalRows = await db
       .select({
         evalId: playerEvaluations.id,
         matchId: playerEvaluations.matchId,
+        peladaId: playerEvaluations.peladaId,
         physical: playerEvaluations.physical,
         dribbling: playerEvaluations.dribbling,
         shooting: playerEvaluations.shooting,
@@ -263,10 +285,10 @@ export async function recalculatePlayerRatings(
         matchNumber: matches.matchNumber,
       })
       .from(playerEvaluations)
-      .innerJoin(matches, eq(playerEvaluations.matchId, matches.id))
-      .innerJoin(peladas, eq(matches.peladaId, peladas.id))
+      .leftJoin(matches, eq(playerEvaluations.matchId, matches.id))
+      .innerJoin(peladas, eq(playerEvaluations.peladaId, peladas.id))
       .where(eq(playerEvaluations.playerId, playerId))
-      .orderBy(desc(peladas.eventDate), desc(matches.matchNumber), desc(matches.id));
+      .orderBy(desc(peladas.eventDate), desc(matches.matchNumber), desc(playerEvaluations.id));
 
     if (evalRows.length === 0) {
       const updated = await db
@@ -297,17 +319,18 @@ export async function recalculatePlayerRatings(
       return updated[0];
     }
 
-    const groupedByMatch = new Map<
-      number,
+    const groupedBySession = new Map<
+      string,
       Array<Record<string, number>>
     >();
 
     for (const row of evalRows) {
-      let bucket = groupedByMatch.get(row.matchId);
+      const sessionKey = row.matchId ? `match_${row.matchId}` : `pelada_${row.peladaId}`;
+      let bucket = groupedBySession.get(sessionKey);
       if (!bucket) {
-        if (groupedByMatch.size >= 10) continue;
+        if (groupedBySession.size >= 10) continue;
         bucket = [];
-        groupedByMatch.set(row.matchId, bucket);
+        groupedBySession.set(sessionKey, bucket);
       }
       const rowScores: Record<string, number> = {
         physical: row.physical,
@@ -326,14 +349,14 @@ export async function recalculatePlayerRatings(
       ...BASE_CRITERIA_KEYS,
       ...criteriaConfig.map((c) => c.key),
     ]);
-    for (const bucket of groupedByMatch.values()) {
+    for (const bucket of groupedBySession.values()) {
       for (const m of bucket) {
         for (const k of Object.keys(m)) allEvalKeys.add(k);
       }
     }
 
     const matchAverages: Array<Record<string, number>> = [];
-    for (const bucket of groupedByMatch.values()) {
+    for (const bucket of groupedBySession.values()) {
       const mAvg: Record<string, number> = {};
       for (const key of allEvalKeys) {
         const vals = bucket
@@ -472,9 +495,10 @@ export async function getPlayerHistoryAndEvolution(playerId: number, groupId?: n
 
     const evalsByMatch = new Map<number, typeof evals>();
     for (const ev of evals) {
-      const arr = evalsByMatch.get(ev.matchId) ?? [];
+      const mId = ev.matchId ?? 0;
+      const arr = evalsByMatch.get(mId) ?? [];
       arr.push(ev);
-      evalsByMatch.set(ev.matchId, arr);
+      evalsByMatch.set(mId, arr);
     }
 
     const historyItems = playerMatches

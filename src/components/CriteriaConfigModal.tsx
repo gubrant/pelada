@@ -6,6 +6,8 @@ import { DEFAULT_GROUP_CRITERIA, type GroupCriterion } from '../types/futsal';
 interface CriteriaConfigModalProps {
   groupId: number;
   groupName: string;
+  peladaId?: number;
+  peladaTitle?: string;
   initialCriteria: GroupCriterion[];
   onClose: () => void;
   onSaved: (criteriaConfig: GroupCriterion[]) => void;
@@ -16,6 +18,8 @@ const BASE_KEYS = new Set(DEFAULT_GROUP_CRITERIA.map((c) => c.key));
 export function CriteriaConfigModal({
   groupId,
   groupName,
+  peladaId,
+  peladaTitle,
   initialCriteria,
   onClose,
   onSaved,
@@ -88,13 +92,13 @@ export function CriteriaConfigModal({
     setSaving(true);
     setError(null);
     try {
-      const res = await apiFetch<{ criteriaConfig: GroupCriterion[] }>(
-        `/api/groups/${groupId}/criteria`,
-        {
-          method: 'PUT',
-          body: JSON.stringify({ criteria: items }),
-        }
-      );
+      const endpoint = peladaId
+        ? `/api/peladas/${peladaId}/criteria`
+        : `/api/groups/${groupId}/criteria`;
+      const res = await apiFetch<{ criteriaConfig: GroupCriterion[] }>(endpoint, {
+        method: 'PUT',
+        body: JSON.stringify({ criteria: items }),
+      });
       onSaved(res.criteriaConfig);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Erro ao salvar critérios.');
@@ -113,7 +117,9 @@ export function CriteriaConfigModal({
             </div>
             <div>
               <h3 className="font-display text-2xl font-bold text-slate-900">
-                Critérios da Nota · {groupName}
+                {peladaId
+                  ? `Critérios do Encontro · ${peladaTitle || groupName}`
+                  : `Critérios da Nota · ${groupName}`}
               </h3>
               <p className="text-xs text-slate-500">
                 Ative, renomeie, adicione critérios ou ajuste o peso de cada atributo ({activeCount}{' '}

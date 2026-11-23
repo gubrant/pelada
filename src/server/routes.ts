@@ -35,6 +35,7 @@ import {
   computeOverall,
   computeWeightedOverall,
   getGroupCriteriaConfig,
+  getPeladaCriteriaConfig,
   getPlayerHistoryAndEvolution,
   getPlayerScoresMap,
   parseCriteriaConfig,
@@ -361,6 +362,49 @@ async function notifyPeladaAdminsForNewPlayer(params: {
   }
 }
 
+function isValidLoginIdentifier(val: string): boolean {
+  if (!val || val.length < 3 || val.length > 180) return false;
+  return /^[a-z0-9._@-]+$/i.test(val);
+}
+
+function parseAccessExpiresAt(raw: unknown): Date | null {
+  if (raw === null || raw === undefined || String(raw).trim() === '') return null;
+  const s = String(raw).trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    const [y, m, d] = s.split('-').map(Number);
+    return new Date(Date.UTC(y, m - 1, d, 23, 59, 59, 999));
+  }
+  const dt = new Date(s);
+  return Number.isNaN(dt.getTime()) ? null : dt;
+}
+
+function normalizeTimeStr(raw: unknown, fallback = '20:00'): string {
+  const s = String(raw ?? '').trim();
+  if (/^\d{2}:\d{2}$/.test(s)) return s;
+  return fallback;
+}
+
+function hasEncounterEndTimeReached(eventDate: string, endTime: string, status: string): boolean {
+  if (status === 'finished') return true;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(eventDate)) return true;
+  const normalizedEnd = /^\d{2}:\d{2}$/.test(endTime) ? endTime : '22:00';
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Sao_Paulo',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(new Date());
+  const getPart = (type: string) => parts.find((p) => p.type === type)?.value ?? '00';
+  const nowDate = `${getPart('year')}-${getPart('month')}-${getPart('day')}`;
+  const nowTime = `${getPart('hour')}:${getPart('minute')}`;
+  if (nowDate > eventDate) return true;
+  if (nowDate < eventDate) return false;
+  return nowTime >= normalizedEnd;
+}
+
 function computeEventualExpiration(eventDate?: string | null): Date {
   if (eventDate && /^\d{4}-\d{2}-\d{2}$/.test(eventDate)) {
     const [y, m, d] = eventDate.split('-').map(Number);
@@ -369,13 +413,16 @@ function computeEventualExpiration(eventDate?: string | null): Date {
   return new Date(Date.now() + 3 * 24 * 60 * 60 * 1000);
 }
 
-function isMemberAccessActive(member: {
-  memberRole: string;
-  playerCategory: string;
-  accessExpiresAt: Date | string | null;
-}): boolean {
-  if (member.memberRole === 'admin') return true;
-  if (member.playerCategory !== 'eventual') return true;
+function isMemberAccessActive(
+  member: {
+    userId?: number | null;
+    memberRole: string;
+    playerCategory: string;
+    accessExpiresAt: Date | string | null;
+  },
+  ownerUserId?: number | null
+): boolean {
+  if (ownerUserId != null && member.userId === ownerUserId) return true;
   if (!member.accessExpiresAt) return true;
   return new Date() <= new Date(member.accessExpiresAt);
 }
@@ -392,7 +439,8 @@ async function hasActiveGroupAccess(
     .from(peladaGroups)
     .where(eq(peladaGroups.id, groupId))
     .limit(1);
-  if (groupRows[0]?.ownerUserId === authUser.id) return true;
+  const ownerUserId = groupRows[0]?.ownerUserId ?? null;
+  if (ownerUserId === authUser.id) return true;
 
   const conds = [eq(peladaGroupMembers.userId, authUser.id)];
   if (authUser.playerId) conds.push(eq(peladaGroupMembers.playerId, authUser.playerId));
@@ -402,7 +450,7 @@ async function hasActiveGroupAccess(
     .from(peladaGroupMembers)
     .where(and(eq(peladaGroupMembers.groupId, groupId), or(...conds)));
 
-  return memberRows.some((m) => isMemberAccessActive(m));
+  return memberRows.some((m) => isMemberAccessActive(m, ownerUserId));
 }
 
 async function notifyPeladaAdminsForJoinRequest(params: {
@@ -903,28 +951,29 @@ apiRouter.post('/auth/register', async (req, res) => {
 
 apiRouter.post('/auth/login', async (req, res) => {
   try {
-    const email = String(req.body?.email ?? '').trim().toLowerCase();
+    const login = String(req.body?.login ?? req.body?.email ?? '').trim().toLowerCase();
     const password = String(req.body?.password ?? '');
+    const groupId = req.body?.groupId ? Number(req.body.groupId) : null;
 
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Informe e-mail e senha.' });
+    if (!login || !password) {
+      return res.status(400).json({ error: 'Informe login e senha.' });
     }
 
-    const found = await db.select().from(users).where(eq(users.email, email)).limit(1);
+    const found = await db.select().from(users).where(eq(users.email, login)).limit(1);
     if (found.length === 0 || !found[0].active) {
-      return res.status(401).json({ error: 'E-mail ou senha inválidos.' });
+      return res.status(401).json({ error: 'Login ou senha inválidos.' });
     }
 
     const user = found[0];
     if (!user.passwordHash) {
       return res.status(401).json({
-        error: 'Esta conta ainda não possui senha definida. Crie uma senha ou peça a um administrador.',
+        error: 'Esta conta ainda não possui senha definida. Crie uma senha ou peça ao administrador da pelada.',
       });
     }
 
     const valid = await verifyPassword(password, user.passwordHash);
     if (!valid) {
-      return res.status(401).json({ error: 'E-mail ou senha inválidos.' });
+      return res.status(401).json({ error: 'Login ou senha inválidos.' });
     }
 
     const linkedPlayers = await db
@@ -932,6 +981,50 @@ apiRouter.post('/auth/login', async (req, res) => {
       .from(players)
       .where(eq(players.userId, user.id))
       .limit(1);
+    const linkedPlayer = linkedPlayers[0] ?? null;
+
+    let groupAccess: { allowed: boolean; reason?: string; expiredAt?: string | null } | null = null;
+    if (groupId && Number.isInteger(groupId)) {
+      const gRows = await db
+        .select({ id: peladaGroups.id, name: peladaGroups.name, ownerUserId: peladaGroups.ownerUserId })
+        .from(peladaGroups)
+        .where(eq(peladaGroups.id, groupId))
+        .limit(1);
+      if (gRows.length === 0) {
+        groupAccess = { allowed: false, reason: 'Pelada fixa não encontrada.' };
+      } else if (user.role === 'admin' || gRows[0].ownerUserId === user.id) {
+        groupAccess = { allowed: true };
+      } else {
+        const conds = [eq(peladaGroupMembers.userId, user.id)];
+        if (linkedPlayer) conds.push(eq(peladaGroupMembers.playerId, linkedPlayer.id));
+        const memRows = await db
+          .select()
+          .from(peladaGroupMembers)
+          .where(and(eq(peladaGroupMembers.groupId, groupId), or(...conds)));
+
+        if (memRows.length === 0) {
+          groupAccess = {
+            allowed: false,
+            reason: `Seu login não possui acesso cadastrado para "${gRows[0].name}". Solicite entrada ou peça ao administrador da pelada.`,
+          };
+        } else {
+          const activeMem = memRows.find((m) => isMemberAccessActive(m, gRows[0].ownerUserId));
+          if (activeMem) {
+            groupAccess = { allowed: true };
+          } else {
+            const exp = memRows[0].accessExpiresAt;
+            const expStr = exp ? new Date(exp).toLocaleDateString('pt-BR') : '';
+            groupAccess = {
+              allowed: false,
+              expiredAt: exp ? new Date(exp).toISOString() : null,
+              reason: expStr
+                ? `Seu acesso a "${gRows[0].name}" expirou em ${expStr}. Peça ao administrador da pelada para renovar a validade.`
+                : `Seu acesso a "${gRows[0].name}" foi encerrado.`,
+            };
+          }
+        }
+      }
+    }
 
     const role = user.role === 'admin' ? 'admin' : 'player';
     const token = signSessionToken({
@@ -949,9 +1042,10 @@ apiRouter.post('/auth/login', async (req, res) => {
         email: user.email,
         name: user.name,
         role,
-        playerId: linkedPlayers[0]?.id ?? null,
+        playerId: linkedPlayer?.id ?? null,
       },
-      player: linkedPlayers[0] ?? null,
+      player: linkedPlayer,
+      groupAccess,
     });
   } catch (error) {
     console.error('Erro ao realizar login:', error);
@@ -1984,6 +2078,73 @@ apiRouter.post('/players/:id/initial-votes', requireAuth, async (req: AuthReques
 // PELADAS FIXAS (GRUPOS DO USUÁRIO)
 // ==========================================
 
+apiRouter.get('/public/groups', async (_req, res) => {
+  try {
+    const groupRows = await db.select().from(peladaGroups).orderBy(desc(peladaGroups.id));
+    if (groupRows.length === 0) {
+      return res.json([]);
+    }
+
+    const gIds = groupRows.map((g) => g.id);
+    const [allMembers, allGroupPeladas, allGroupSeasons] = await Promise.all([
+      db
+        .select({
+          groupId: peladaGroupMembers.groupId,
+          userId: peladaGroupMembers.userId,
+          memberRole: peladaGroupMembers.memberRole,
+          playerCategory: peladaGroupMembers.playerCategory,
+          accessExpiresAt: peladaGroupMembers.accessExpiresAt,
+        })
+        .from(peladaGroupMembers)
+        .where(inArray(peladaGroupMembers.groupId, gIds)),
+      db
+        .select({
+          id: peladas.id,
+          groupId: peladas.groupId,
+        })
+        .from(peladas)
+        .where(inArray(peladas.groupId, gIds)),
+      db
+        .select({
+          groupId: seasons.groupId,
+          name: seasons.name,
+          status: seasons.status,
+        })
+        .from(seasons)
+        .where(inArray(seasons.groupId, gIds))
+        .orderBy(desc(seasons.id)),
+    ]);
+
+    const payload = groupRows.map((g) => {
+      const gMembers = allMembers.filter((m) => m.groupId === g.id);
+      const gPeladas = allGroupPeladas.filter((p) => p.groupId === g.id);
+      const openSeason = allGroupSeasons.find((s) => s.groupId === g.id && s.status === 'open');
+      return {
+        id: g.id,
+        name: g.name,
+        description: g.description,
+        weekday: g.weekday,
+        startTime: g.startTime,
+        endTime: g.endTime,
+        location: g.location,
+        fullAddress: g.fullAddress,
+        avulsoFee: g.avulsoFee,
+        playersPerTeam: g.playersPerTeam,
+        defaultTeamsCount: g.defaultTeamsCount,
+        photoUrl: g.photoUrl,
+        membersCount: gMembers.filter((m) => isMemberAccessActive(m, g.ownerUserId)).length,
+        peladasCount: gPeladas.length,
+        openSeasonName: openSeason?.name ?? null,
+      };
+    });
+
+    res.json(payload);
+  } catch (error) {
+    console.error('Erro ao listar peladas fixas públicas:', error);
+    res.status(500).json({ error: 'Falha ao carregar as peladas fixas cadastradas.' });
+  }
+});
+
 apiRouter.get('/groups', requireAuth, async (req: AuthRequest, res) => {
   try {
     const authUser = req.authUser!;
@@ -2005,6 +2166,7 @@ apiRouter.get('/groups', requireAuth, async (req: AuthRequest, res) => {
             title: peladas.title,
             eventDate: peladas.eventDate,
             startTime: peladas.startTime,
+            endTime: peladas.endTime,
             status: peladas.status,
           })
           .from(peladas)
@@ -2044,13 +2206,15 @@ apiRouter.get('/groups', requireAuth, async (req: AuthRequest, res) => {
         (m) => m.userId === authUser.id || (authUser.playerId != null && m.playerId === authUser.playerId)
       );
       const isOwner = g.ownerUserId === authUser.id;
+      const myMemberActive = myRoleEntry ? isMemberAccessActive(myRoleEntry, g.ownerUserId) : false;
       const myMemberRole: 'admin' | 'member' =
-        isOwner || myRoleEntry?.memberRole === 'admin' ? 'admin' : 'member';
-      const isGroupAdmin = authUser.role === 'admin' || isOwner || myRoleEntry?.memberRole === 'admin';
+        isOwner || (myRoleEntry?.memberRole === 'admin' && myMemberActive) ? 'admin' : 'member';
+      const isGroupAdmin =
+        authUser.role === 'admin' || isOwner || (myRoleEntry?.memberRole === 'admin' && myMemberActive);
 
       let myAdminTitle: 'presidente' | 'tesoureiro' | 'presidente_tesoureiro' | 'administrador' | null =
         null;
-      if (myRoleEntry?.memberRole === 'admin') {
+      if (myRoleEntry?.memberRole === 'admin' && myMemberActive) {
         if (myRoleEntry.adminTitle && VALID_ADMIN_TITLES.has(myRoleEntry.adminTitle)) {
           myAdminTitle = myRoleEntry.adminTitle as
             | 'presidente'
@@ -2078,7 +2242,7 @@ apiRouter.get('/groups', requireAuth, async (req: AuthRequest, res) => {
       if (authUser.role === 'admin' || isOwner) {
         membershipStatus = 'member';
       } else if (myRoleEntry) {
-        membershipStatus = isMemberAccessActive(myRoleEntry) ? 'member' : 'expired';
+        membershipStatus = myMemberActive ? 'member' : 'expired';
       } else if (jr?.status === 'pending') {
         membershipStatus = 'pending';
       } else if (jr?.status === 'rejected') {
@@ -2091,7 +2255,7 @@ apiRouter.get('/groups', requireAuth, async (req: AuthRequest, res) => {
 
       return {
         ...g,
-        membersCount: gMembers.filter((m) => isMemberAccessActive(m)).length,
+        membersCount: gMembers.filter((m) => isMemberAccessActive(m, g.ownerUserId)).length,
         peladasCount: gPeladas.length,
         openSeasonName: openSeason?.name ?? null,
         myMemberRole,
@@ -2121,6 +2285,7 @@ apiRouter.get('/groups', requireAuth, async (req: AuthRequest, res) => {
           title: p.title,
           eventDate: p.eventDate,
           startTime: p.startTime,
+          endTime: p.endTime,
           status: p.status,
         })),
       };
@@ -2151,7 +2316,8 @@ apiRouter.post('/groups', requireAuth, requireAdmin, async (req: AuthRequest, re
     const name = String(req.body?.name ?? '').trim();
     const description = String(req.body?.description ?? '').trim() || null;
     const weekday = String(req.body?.weekday ?? 'Quarta-feira').trim() || 'Quarta-feira';
-    const startTime = String(req.body?.startTime ?? '20:00').trim() || '20:00';
+    const startTime = normalizeTimeStr(req.body?.startTime, '20:00');
+    const endTime = normalizeTimeStr(req.body?.endTime, '22:00');
     const location = String(req.body?.location ?? 'Quadra Principal').trim() || 'Quadra Principal';
     const fullAddress = String(req.body?.fullAddress ?? '').trim().slice(0, 300) || null;
     const avulsoFee = parseNonNegativeFee(req.body?.avulsoFee, 0);
@@ -2176,6 +2342,7 @@ apiRouter.post('/groups', requireAuth, requireAdmin, async (req: AuthRequest, re
         description,
         weekday,
         startTime,
+        endTime,
         location,
         fullAddress,
         avulsoFee,
@@ -2278,7 +2445,8 @@ apiRouter.put('/groups/:id', requireAuth, async (req: AuthRequest, res) => {
             ? String(req.body.description ?? '').trim() || null
             : prev.description,
         weekday: req.body?.weekday ? String(req.body.weekday).trim() : prev.weekday,
-        startTime: req.body?.startTime ? String(req.body.startTime).trim() : prev.startTime,
+        startTime: req.body?.startTime ? normalizeTimeStr(req.body.startTime, prev.startTime) : prev.startTime,
+        endTime: req.body?.endTime ? normalizeTimeStr(req.body.endTime, prev.endTime) : prev.endTime,
         location: req.body?.location ? String(req.body.location).trim() : prev.location,
         fullAddress: nextFullAddress,
         avulsoFee: nextAvulsoFee,
@@ -2314,10 +2482,24 @@ apiRouter.delete('/groups/:id', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-apiRouter.get('/groups/:id/members', requireAuth, async (req, res) => {
+apiRouter.get('/groups/:id/members', requireAuth, async (req: AuthRequest, res) => {
   try {
     const groupId = Number(req.params.id);
     if (!Number.isInteger(groupId)) return res.status(400).json({ error: 'ID inválido.' });
+
+    const authUser = req.authUser!;
+    const isAdmin = await isUserAdminOfGroup(authUser, groupId);
+    const hasAccess = isAdmin || (await hasActiveGroupAccess(authUser, groupId));
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Acesso não autorizado a esta pelada fixa.' });
+    }
+
+    const groupRows = await db
+      .select({ ownerUserId: peladaGroups.ownerUserId })
+      .from(peladaGroups)
+      .where(eq(peladaGroups.id, groupId))
+      .limit(1);
+    const ownerUserId = groupRows[0]?.ownerUserId ?? null;
 
     const rows = await db
       .select({
@@ -2333,6 +2515,8 @@ apiRouter.get('/groups/:id/members', requireAuth, async (req, res) => {
         summaryEmailSentAt: peladaGroupMembers.summaryEmailSentAt,
         userName: users.name,
         userEmail: users.email,
+        userRole: users.role,
+        userHasPassword: sql<boolean>`${users.passwordHash} IS NOT NULL`,
         playerName: players.name,
         playerNickname: players.nickname,
         playerPosition: players.position,
@@ -2344,10 +2528,422 @@ apiRouter.get('/groups/:id/members', requireAuth, async (req, res) => {
       .leftJoin(players, eq(peladaGroupMembers.playerId, players.id))
       .where(eq(peladaGroupMembers.groupId, groupId));
 
-    res.json(rows);
+    const payload = rows.map((r) => {
+      const canEditCredentials =
+        isAdmin &&
+        (authUser.role === 'admin' ||
+          (r.userRole !== 'admin' && (r.userId == null || r.userId !== ownerUserId || r.userId === authUser.id)));
+      return {
+        id: r.id,
+        groupId: r.groupId,
+        userId: r.userId,
+        playerId: r.playerId,
+        memberRole: r.memberRole,
+        adminTitle: r.adminTitle,
+        playerCategory: r.playerCategory,
+        accessPeladaId: r.accessPeladaId,
+        accessExpiresAt: r.accessExpiresAt,
+        summaryEmailSentAt: r.summaryEmailSentAt,
+        userName: r.userName,
+        userEmail: isAdmin || r.userId === authUser.id ? r.userEmail : null,
+        userHasPassword: isAdmin ? Boolean(r.userHasPassword) : false,
+        canEditCredentials,
+        playerName: r.playerName,
+        playerNickname: r.playerNickname,
+        playerPosition: r.playerPosition,
+        playerPhoto: r.playerPhoto,
+        playerOverall: r.playerOverall,
+      };
+    });
+
+    res.json(payload);
   } catch (error) {
     console.error('Erro ao listar participantes da pelada fixa:', error);
     res.status(500).json({ error: 'Falha ao carregar membros da pelada.' });
+  }
+});
+
+apiRouter.post('/groups/:id/members/create-access', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const groupId = Number(req.params.id);
+    if (!Number.isInteger(groupId)) return res.status(400).json({ error: 'ID inválido.' });
+
+    const authUser = req.authUser!;
+    const allowed = await isUserAdminOfGroup(authUser, groupId);
+    if (!allowed) {
+      return res.status(403).json({
+        error: 'Apenas o criador ou administradores desta pelada fixa podem criar acessos de jogadores.',
+      });
+    }
+
+    const reqPlayerId = req.body?.playerId ? Number(req.body.playerId) : null;
+    const login = String(req.body?.login ?? req.body?.email ?? '').trim().toLowerCase();
+    const password = String(req.body?.password ?? '');
+    const rawName = String(req.body?.name ?? '').trim();
+    const rawNickname = String(req.body?.nickname ?? '').trim();
+    const position = VALID_POSITIONS.has(req.body?.position) ? String(req.body.position) : 'Ala Direito';
+    const playerCategory = VALID_CATEGORIES.has(req.body?.playerCategory)
+      ? String(req.body.playerCategory)
+      : 'mensalista';
+    const memberRole = req.body?.memberRole === 'admin' ? 'admin' : 'member';
+    const accessExpiresAt = parseAccessExpiresAt(req.body?.accessExpiresAt);
+
+    if (!isValidLoginIdentifier(login)) {
+      return res.status(400).json({
+        error: 'Informe um login válido (mínimo 3 caracteres, sem espaços — pode ser e-mail ou nome de usuário).',
+      });
+    }
+    if (password.length < 6) {
+      return res.status(400).json({
+        error: 'A senha deve ter no mínimo 6 dígitos.',
+      });
+    }
+
+    let targetPlayer: typeof players.$inferSelect | null = null;
+    if (reqPlayerId && Number.isInteger(reqPlayerId)) {
+      const pRows = await db.select().from(players).where(eq(players.id, reqPlayerId)).limit(1);
+      if (pRows.length === 0) {
+        return res.status(404).json({ error: 'Jogador não encontrado.' });
+      }
+      if (pRows[0].exclusiveGroupId != null && pRows[0].exclusiveGroupId !== groupId) {
+        return res.status(400).json({
+          error: 'Este jogador é exclusivo de outra pelada fixa.',
+        });
+      }
+      targetPlayer = pRows[0];
+    }
+
+    const name = rawName || targetPlayer?.name || rawNickname || login;
+    const nickname = rawNickname || targetPlayer?.nickname || name.split(' ')[0] || login;
+
+    // Check if login already exists in users
+    const existingUsers = await db.select().from(users).where(eq(users.email, login)).limit(1);
+    const passwordHash = await hashPassword(password);
+    let savedUser: typeof users.$inferSelect;
+
+    if (existingUsers.length > 0) {
+      const exUser = existingUsers[0];
+      if (exUser.role === 'admin' && authUser.role !== 'admin') {
+        return res.status(403).json({
+          error: 'Não é permitido alterar credenciais de um administrador global por esta tela.',
+        });
+      }
+      if (targetPlayer?.userId && targetPlayer.userId !== exUser.id) {
+        return res.status(409).json({
+          error: 'Este login já pertence a outro usuário cadastrado. Escolha outro login.',
+        });
+      }
+      const alreadyInGroup = await db
+        .select({ id: peladaGroupMembers.id })
+        .from(peladaGroupMembers)
+        .where(and(eq(peladaGroupMembers.groupId, groupId), eq(peladaGroupMembers.userId, exUser.id)))
+        .limit(1);
+
+      if (alreadyInGroup.length === 0 && authUser.role !== 'admin') {
+        return res.status(409).json({
+          error: 'Este login já está em uso no sistema. Escolha um login específico para este jogador.',
+        });
+      }
+
+      const updatedUsers = await db
+        .update(users)
+        .set({
+          name,
+          passwordHash,
+          mustChangePassword: false,
+          active: true,
+        })
+        .where(eq(users.id, exUser.id))
+        .returning();
+      savedUser = updatedUsers[0];
+    } else if (targetPlayer?.userId) {
+      const currentOwnerUsers = await db
+        .select()
+        .from(users)
+        .where(eq(users.id, targetPlayer.userId))
+        .limit(1);
+      const curUser = currentOwnerUsers[0];
+      if (curUser) {
+        if (curUser.role === 'admin' && authUser.role !== 'admin') {
+          return res.status(403).json({
+            error: 'Não é permitido alterar credenciais de um administrador global.',
+          });
+        }
+        const updatedUsers = await db
+          .update(users)
+          .set({
+            email: login,
+            name,
+            passwordHash,
+            mustChangePassword: false,
+            active: true,
+          })
+          .where(eq(users.id, curUser.id))
+          .returning();
+        savedUser = updatedUsers[0];
+      } else {
+        const insertedUsers = await db
+          .insert(users)
+          .values({
+            uid: `local:${crypto.randomUUID()}`,
+            email: login,
+            name,
+            role: 'player',
+            passwordHash,
+            active: true,
+          })
+          .returning();
+        savedUser = insertedUsers[0];
+      }
+    } else {
+      const insertedUsers = await db
+        .insert(users)
+        .values({
+          uid: `local:${crypto.randomUUID()}`,
+          email: login,
+          name,
+          role: 'player',
+          passwordHash,
+          active: true,
+        })
+        .returning();
+      savedUser = insertedUsers[0];
+    }
+
+    if (targetPlayer) {
+      const updatedP = await db
+        .update(players)
+        .set({
+          userId: savedUser.id,
+          name,
+          nickname,
+          email: targetPlayer.email || (login.includes('@') ? login : targetPlayer.email),
+        })
+        .where(eq(players.id, targetPlayer.id))
+        .returning();
+      targetPlayer = updatedP[0];
+    } else {
+      const existingPlayerForUser = await db
+        .select()
+        .from(players)
+        .where(eq(players.userId, savedUser.id))
+        .limit(1);
+
+      if (existingPlayerForUser.length > 0) {
+        targetPlayer = existingPlayerForUser[0];
+      } else {
+        const insertedPlayers = await db
+          .insert(players)
+          .values({
+            userId: savedUser.id,
+            name,
+            nickname,
+            position,
+            dominantFoot: 'Destro',
+            email: login.includes('@') ? login : null,
+            category: playerCategory,
+            exclusiveGroupId: groupId,
+            ratedByUserId: authUser.id,
+            initRatingStatus: 'approved',
+            profileCompleted: true,
+          })
+          .returning();
+        targetPlayer = insertedPlayers[0];
+      }
+    }
+
+    const member = await upsertGroupMembership({
+      groupId,
+      userId: savedUser.id,
+      playerId: targetPlayer.id,
+      memberRole,
+      playerCategory,
+      accessExpiresAt,
+      summaryEmailSentAt: null,
+    });
+
+    res.status(201).json({
+      member,
+      user: {
+        id: savedUser.id,
+        email: savedUser.email,
+        name: savedUser.name,
+        role: savedUser.role,
+      },
+      player: targetPlayer,
+    });
+  } catch (error) {
+    console.error('Erro ao criar acesso do jogador na pelada fixa:', error);
+    res.status(500).json({ error: 'Falha ao cadastrar login e senha para o jogador.' });
+  }
+});
+
+apiRouter.patch('/groups/:id/members/:memberId/access', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const groupId = Number(req.params.id);
+    const memberId = Number(req.params.memberId);
+    if (!Number.isInteger(groupId) || !Number.isInteger(memberId)) {
+      return res.status(400).json({ error: 'Parâmetros inválidos.' });
+    }
+
+    const authUser = req.authUser!;
+    const allowed = await isUserAdminOfGroup(authUser, groupId);
+    if (!allowed) {
+      return res.status(403).json({
+        error: 'Apenas o criador ou administradores desta pelada podem editar acessos.',
+      });
+    }
+
+    const groupRows = await db
+      .select({ ownerUserId: peladaGroups.ownerUserId })
+      .from(peladaGroups)
+      .where(eq(peladaGroups.id, groupId))
+      .limit(1);
+    const ownerUserId = groupRows[0]?.ownerUserId ?? null;
+
+    const existingRows = await db
+      .select()
+      .from(peladaGroupMembers)
+      .where(and(eq(peladaGroupMembers.groupId, groupId), eq(peladaGroupMembers.id, memberId)))
+      .limit(1);
+    if (existingRows.length === 0) {
+      return res.status(404).json({ error: 'Participante não encontrado nesta pelada fixa.' });
+    }
+    const member = existingRows[0];
+
+    let linkedUser: typeof users.$inferSelect | null = null;
+    if (member.userId) {
+      const uRows = await db.select().from(users).where(eq(users.id, member.userId)).limit(1);
+      linkedUser = uRows[0] ?? null;
+    }
+
+    if (
+      linkedUser &&
+      authUser.role !== 'admin' &&
+      (linkedUser.role === 'admin' || (linkedUser.id === ownerUserId && linkedUser.id !== authUser.id))
+    ) {
+      return res.status(403).json({
+        error: 'Você não tem permissão para alterar as credenciais deste administrador.',
+      });
+    }
+
+    const rawName = req.body?.name !== undefined ? String(req.body.name ?? '').trim() : undefined;
+    const rawNickname =
+      req.body?.nickname !== undefined ? String(req.body.nickname ?? '').trim() : undefined;
+    const rawLogin =
+      req.body?.login !== undefined ? String(req.body.login ?? '').trim().toLowerCase() : undefined;
+    const rawPassword =
+      req.body?.password !== undefined ? String(req.body.password ?? '') : undefined;
+
+    if (rawLogin !== undefined && rawLogin !== '') {
+      if (!isValidLoginIdentifier(rawLogin)) {
+        return res.status(400).json({
+          error: 'Informe um login válido (mínimo 3 caracteres, sem espaços).',
+        });
+      }
+      const conflict = await db.select().from(users).where(eq(users.email, rawLogin)).limit(1);
+      if (conflict.length > 0 && conflict[0].id !== linkedUser?.id) {
+        return res.status(409).json({
+          error: 'Este login já está em uso por outro usuário. Escolha outro login.',
+        });
+      }
+    }
+
+    if (rawPassword !== undefined && rawPassword !== '' && rawPassword.length < 6) {
+      return res.status(400).json({ error: 'A senha deve ter no mínimo 6 dígitos.' });
+    }
+
+    let resolvedUserId = member.userId;
+    if (linkedUser) {
+      const userUpdates: Partial<typeof users.$inferInsert> = {};
+      if (rawLogin) userUpdates.email = rawLogin;
+      if (rawName) userUpdates.name = rawName;
+      if (rawPassword && rawPassword.length >= 6) {
+        userUpdates.passwordHash = await hashPassword(rawPassword);
+        userUpdates.mustChangePassword = false;
+      }
+      if (Object.keys(userUpdates).length > 0) {
+        await db.update(users).set(userUpdates).where(eq(users.id, linkedUser.id));
+      }
+    } else if (rawLogin) {
+      if (!rawPassword || rawPassword.length < 6) {
+        return res.status(400).json({
+          error: 'Informe uma senha (mínimo 6 dígitos) ao criar o login do jogador.',
+        });
+      }
+      let fallbackName = rawName || rawNickname || rawLogin;
+      if (member.playerId && !rawName) {
+        const pRow = await db
+          .select({ name: players.name })
+          .from(players)
+          .where(eq(players.id, member.playerId))
+          .limit(1);
+        if (pRow[0]?.name) fallbackName = pRow[0].name;
+      }
+      const passwordHash = await hashPassword(rawPassword);
+      const inserted = await db
+        .insert(users)
+        .values({
+          uid: `local:${crypto.randomUUID()}`,
+          email: rawLogin,
+          name: fallbackName,
+          role: 'player',
+          passwordHash,
+          active: true,
+        })
+        .returning();
+      resolvedUserId = inserted[0].id;
+      if (member.playerId) {
+        await db
+          .update(players)
+          .set({ userId: resolvedUserId })
+          .where(eq(players.id, member.playerId));
+      }
+    }
+
+    if (member.playerId) {
+      const playerUpdates: Partial<typeof players.$inferInsert> = {};
+      if (rawName) playerUpdates.name = rawName;
+      if (rawNickname) playerUpdates.nickname = rawNickname;
+      if (req.body?.playerCategory && VALID_CATEGORIES.has(req.body.playerCategory)) {
+        playerUpdates.category = String(req.body.playerCategory);
+      }
+      if (Object.keys(playerUpdates).length > 0) {
+        await db.update(players).set(playerUpdates).where(eq(players.id, member.playerId));
+      }
+    }
+
+    const nextCategory =
+      req.body?.playerCategory && VALID_CATEGORIES.has(req.body.playerCategory)
+        ? String(req.body.playerCategory)
+        : member.playerCategory;
+    const nextRole =
+      req.body?.memberRole === 'admin'
+        ? 'admin'
+        : req.body?.memberRole === 'member'
+          ? 'member'
+          : member.memberRole;
+    const nextExpiresAt =
+      req.body?.accessExpiresAt !== undefined
+        ? parseAccessExpiresAt(req.body.accessExpiresAt)
+        : member.accessExpiresAt;
+
+    const updatedMember = await db
+      .update(peladaGroupMembers)
+      .set({
+        userId: resolvedUserId,
+        playerCategory: nextCategory,
+        memberRole: nextRole,
+        accessExpiresAt: nextExpiresAt,
+        summaryEmailSentAt: nextExpiresAt == null || new Date(nextExpiresAt) > new Date() ? null : member.summaryEmailSentAt,
+      })
+      .where(eq(peladaGroupMembers.id, memberId))
+      .returning();
+
+    res.json({ member: updatedMember[0] });
+  } catch (error) {
+    console.error('Erro ao atualizar acesso do jogador:', error);
+    res.status(500).json({ error: 'Falha ao atualizar acesso do participante.' });
   }
 });
 
@@ -3457,7 +4053,7 @@ apiRouter.post('/peladas', requireAuth, async (req: AuthRequest, res) => {
     const title = String(req.body?.title ?? '').trim();
     const location = String(req.body?.location ?? '').trim() || 'Quadra Principal';
     const eventDate = String(req.body?.eventDate ?? new Date().toISOString().slice(0, 10));
-    const startTime = String(req.body?.startTime ?? '20:00');
+    const startTime = normalizeTimeStr(req.body?.startTime, '20:00');
     const playersPerTeam = Math.max(3, Math.min(7, Number(req.body?.playersPerTeam ?? 5)));
     const teamCount = Math.max(2, Math.min(12, Math.round(Number(req.body?.teamCount ?? 2))));
     const notes = String(req.body?.notes ?? '').trim() || null;
@@ -3486,6 +4082,17 @@ apiRouter.post('/peladas', requireAuth, async (req: AuthRequest, res) => {
       return res.status(403).json({ error: 'Apenas administradores da pelada podem cadastrar encontros.' });
     }
 
+    let fallbackEndTime = '22:00';
+    if (resolvedGroupId) {
+      const gRow = await db
+        .select({ endTime: peladaGroups.endTime })
+        .from(peladaGroups)
+        .where(eq(peladaGroups.id, resolvedGroupId))
+        .limit(1);
+      if (gRow[0]?.endTime) fallbackEndTime = gRow[0].endTime;
+    }
+    const endTime = normalizeTimeStr(req.body?.endTime, fallbackEndTime);
+
     const inserted = await db
       .insert(peladas)
       .values({
@@ -3495,6 +4102,7 @@ apiRouter.post('/peladas', requireAuth, async (req: AuthRequest, res) => {
         location,
         eventDate,
         startTime,
+        endTime,
         playersPerTeam,
         status: 'in_progress',
         notes,
@@ -3548,7 +4156,7 @@ apiRouter.get('/peladas/:id', requireAuth, async (req: AuthRequest, res) => {
       const allowed = await hasActiveGroupAccess(req.authUser!, peladaRows[0].groupId);
       if (!allowed) {
         return res.status(403).json({
-          error: 'Seu acesso a esta pelada não está autorizado ou o prazo de 3 dias após a pelada já expirou.',
+          error: 'Seu acesso a esta pelada não está autorizado ou o prazo de validade expirou.',
         });
       }
     }
@@ -3591,10 +4199,13 @@ apiRouter.get('/peladas/:id', requireAuth, async (req: AuthRequest, res) => {
       .orderBy(matchEvents.minute, matchEvents.id);
 
     const stats = await computePeladaStats(id);
-    const criteriaConfig = await getGroupCriteriaConfig(peladaRows[0].groupId);
+    const criteriaConfig = await getPeladaCriteriaConfig(id);
 
     res.json({
-      pelada: peladaRows[0],
+      pelada: {
+        ...peladaRows[0],
+        criteriaConfig,
+      },
       criteriaConfig,
       teams,
       attendances,
@@ -3690,7 +4301,8 @@ apiRouter.post('/peladas/:id/rsvp', requireAuth, async (req: AuthRequest, res) =
           and(
             eq(peladaGroupMembers.groupId, pelRow[0].groupId),
             eq(peladaGroupMembers.playerId, playerId),
-            eq(peladaGroupMembers.playerCategory, 'eventual')
+            eq(peladaGroupMembers.playerCategory, 'eventual'),
+            isNull(peladaGroupMembers.accessExpiresAt)
           )
         );
     }
@@ -3757,7 +4369,8 @@ apiRouter.post('/peladas/:id/attendance', requireAuth, async (req: AuthRequest, 
             and(
               eq(peladaGroupMembers.groupId, pelRow[0].groupId),
               eq(peladaGroupMembers.playerId, playerId),
-              eq(peladaGroupMembers.playerCategory, 'eventual')
+              eq(peladaGroupMembers.playerCategory, 'eventual'),
+              isNull(peladaGroupMembers.accessExpiresAt)
             )
           );
       }
@@ -4279,6 +4892,334 @@ apiRouter.post('/matches/:id/evaluations', requireAuth, async (req: AuthRequest,
   } catch (error) {
     console.error('Erro ao salvar avaliação:', error);
     res.status(500).json({ error: 'Falha ao registrar avaliação do jogador.' });
+  }
+});
+
+apiRouter.put('/peladas/:id/criteria', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const peladaId = Number(req.params.id);
+    if (!Number.isInteger(peladaId)) return res.status(400).json({ error: 'ID inválido.' });
+
+    const pelRows = await db.select().from(peladas).where(eq(peladas.id, peladaId)).limit(1);
+    if (pelRows.length === 0) return res.status(404).json({ error: 'Encontro não encontrado.' });
+
+    const allowed = await isUserAdminOfGroup(req.authUser!, pelRows[0].groupId);
+    if (!allowed) {
+      return res.status(403).json({
+        error: 'Apenas administradores da pelada podem ajustar os critérios deste encontro.',
+      });
+    }
+
+    const inputList = req.body?.criteria;
+    if (!Array.isArray(inputList) || inputList.length === 0) {
+      return res.status(400).json({ error: 'Informe ao menos um critério válido.' });
+    }
+
+    const sanitized: GroupCriterion[] = [];
+    const seen = new Set<string>();
+    for (const item of inputList) {
+      if (!item || typeof item !== 'object') continue;
+      const rawKey = String(item.key ?? '')
+        .trim()
+        .replace(/[^a-zA-Z0-9_-]/g, '')
+        .slice(0, 48);
+      const label = String(item.label ?? '').trim().slice(0, 60);
+      if (!label) continue;
+      const key =
+        rawKey ||
+        `custom_${label
+          .toLowerCase()
+          .normalize('NFD')
+          .replace(/[\u0300-\u036f]/g, '')
+          .replace(/[^a-z0-9]+/g, '_')
+          .slice(0, 24)}_${sanitized.length}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const short =
+        String(item.short ?? label.slice(0, 10)).trim().slice(0, 16) || label.slice(0, 10);
+      const weightNum = Number(item.weight ?? 1);
+      const weight = Number.isFinite(weightNum)
+        ? Math.max(0.5, Math.min(5, Math.round(weightNum * 2) / 2))
+        : 1;
+      sanitized.push({
+        key,
+        label,
+        short,
+        weight,
+        enabled: item.enabled !== false,
+      });
+    }
+
+    if (!sanitized.some((c) => c.enabled)) {
+      return res.status(400).json({
+        error: 'Pelo menos 1 critério deve permanecer ativo para compor a nota.',
+      });
+    }
+
+    await db
+      .update(peladas)
+      .set({ criteriaConfig: JSON.stringify(sanitized) })
+      .where(eq(peladas.id, peladaId));
+
+    const attRows = await db
+      .select({ playerId: peladaAttendances.playerId })
+      .from(peladaAttendances)
+      .where(eq(peladaAttendances.peladaId, peladaId));
+    for (const a of attRows) {
+      await recalculatePlayerRatings(a.playerId, {
+        groupId: pelRows[0].groupId,
+        criteriaOverride: sanitized,
+      });
+    }
+
+    res.json({ criteriaConfig: sanitized });
+  } catch (error) {
+    console.error('Erro ao salvar critérios do encontro:', error);
+    res.status(500).json({ error: 'Falha ao salvar critérios do encontro.' });
+  }
+});
+
+apiRouter.get('/peladas/:id/encounter-evaluation', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const peladaId = Number(req.params.id);
+    if (!Number.isInteger(peladaId)) return res.status(400).json({ error: 'ID inválido.' });
+
+    const authUser = req.authUser!;
+    const pelRows = await db.select().from(peladas).where(eq(peladas.id, peladaId)).limit(1);
+    if (pelRows.length === 0) return res.status(404).json({ error: 'Encontro não encontrado.' });
+    const pelada = pelRows[0];
+
+    if (pelada.groupId) {
+      const allowed = await hasActiveGroupAccess(authUser, pelada.groupId);
+      if (!allowed) {
+        return res.status(403).json({ error: 'Acesso não autorizado a esta pelada.' });
+      }
+    }
+
+    const attRows = await db
+      .select({
+        playerId: players.id,
+        userId: players.userId,
+        name: players.name,
+        nickname: players.nickname,
+        position: players.position,
+        photoUrl: players.photoUrl,
+        overall: players.curOverall,
+      })
+      .from(peladaAttendances)
+      .innerJoin(players, eq(peladaAttendances.playerId, players.id))
+      .where(and(eq(peladaAttendances.peladaId, peladaId), eq(peladaAttendances.present, true)));
+
+    const endTimeReached = hasEncounterEndTimeReached(
+      pelada.eventDate,
+      pelada.endTime,
+      pelada.status
+    );
+    const userAttended = attRows.some(
+      (a) =>
+        (authUser.playerId != null && a.playerId === authUser.playerId) ||
+        (a.userId != null && a.userId === authUser.id)
+    );
+    const canEvaluate = userAttended && endTimeReached;
+
+    const criteriaConfig = await getPeladaCriteriaConfig(peladaId);
+    const participants = attRows
+      .filter(
+        (a) =>
+          !(authUser.playerId != null && a.playerId === authUser.playerId) &&
+          !(a.userId != null && a.userId === authUser.id)
+      )
+      .map((a) => ({
+        playerId: a.playerId,
+        name: a.name,
+        nickname: a.nickname,
+        position: a.position,
+        photoUrl: a.photoUrl,
+        overall: a.overall,
+      }));
+
+    const myEvaluations = await db
+      .select()
+      .from(playerEvaluations)
+      .where(
+        and(
+          eq(playerEvaluations.peladaId, peladaId),
+          isNull(playerEvaluations.matchId),
+          eq(playerEvaluations.evaluatorUserId, authUser.id)
+        )
+      );
+
+    res.json({
+      canEvaluate,
+      attended: userAttended,
+      endTimeReached,
+      criteriaConfig,
+      participants,
+      myEvaluations,
+    });
+  } catch (error) {
+    console.error('Erro ao carregar avaliações do encontro:', error);
+    res.status(500).json({ error: 'Falha ao carregar contexto de avaliação do encontro.' });
+  }
+});
+
+apiRouter.post('/peladas/:id/encounter-evaluate', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const peladaId = Number(req.params.id);
+    const playerId = Number(req.body?.playerId);
+    if (!Number.isInteger(peladaId) || !Number.isInteger(playerId)) {
+      return res.status(400).json({ error: 'Encontro ou jogador inválido.' });
+    }
+
+    const authUser = req.authUser!;
+    const pelRows = await db.select().from(peladas).where(eq(peladas.id, peladaId)).limit(1);
+    if (pelRows.length === 0) return res.status(404).json({ error: 'Encontro não encontrado.' });
+    const pelada = pelRows[0];
+
+    if (pelada.groupId) {
+      const allowed = await hasActiveGroupAccess(authUser, pelada.groupId);
+      if (!allowed) {
+        return res.status(403).json({ error: 'Acesso não autorizado a esta pelada.' });
+      }
+    }
+
+    const endTimeReached = hasEncounterEndTimeReached(
+      pelada.eventDate,
+      pelada.endTime,
+      pelada.status
+    );
+    if (!endTimeReached) {
+      return res.status(403).json({
+        error: `A avaliação será liberada após o horário de término (${pelada.endTime}) ou encerramento do encontro.`,
+      });
+    }
+
+    const attRows = await db
+      .select({
+        playerId: players.id,
+        userId: players.userId,
+      })
+      .from(peladaAttendances)
+      .innerJoin(players, eq(peladaAttendances.playerId, players.id))
+      .where(and(eq(peladaAttendances.peladaId, peladaId), eq(peladaAttendances.present, true)));
+
+    const userAttended = attRows.some(
+      (a) =>
+        (authUser.playerId != null && a.playerId === authUser.playerId) ||
+        (a.userId != null && a.userId === authUser.id)
+    );
+    if (!userAttended) {
+      return res.status(403).json({
+        error: 'Apenas jogadores que compareceram a este encontro podem avaliar os participantes.',
+      });
+    }
+
+    const targetAtt = attRows.find((a) => a.playerId === playerId);
+    if (!targetAtt) {
+      return res.status(400).json({
+        error: 'Este jogador não consta como presente neste encontro.',
+      });
+    }
+    if (
+      (authUser.playerId != null && targetAtt.playerId === authUser.playerId) ||
+      (targetAtt.userId != null && targetAtt.userId === authUser.id)
+    ) {
+      return res.status(400).json({ error: 'Você não pode avaliar a si mesmo.' });
+    }
+
+    const criteriaConfig = await getPeladaCriteriaConfig(peladaId);
+    const rawScores = req.body?.scores && typeof req.body.scores === 'object' ? req.body.scores : {};
+    const scoresMap: Record<string, number> = {
+      physical: clampHalfStepScore(rawScores.physical ?? req.body?.physical, 7),
+      dribbling: clampHalfStepScore(rawScores.dribbling ?? req.body?.dribbling, 7),
+      shooting: clampHalfStepScore(rawScores.shooting ?? req.body?.shooting, 7),
+      defense: clampHalfStepScore(rawScores.defense ?? req.body?.defense, 7),
+      attack: clampHalfStepScore(rawScores.attack ?? req.body?.attack, 7),
+      passing: clampHalfStepScore(rawScores.passing ?? req.body?.passing, 7),
+      positioning: clampHalfStepScore(rawScores.positioning ?? req.body?.positioning, 7),
+    };
+    for (const c of criteriaConfig) {
+      if (rawScores[c.key] !== undefined) {
+        scoresMap[c.key] = clampHalfStepScore(rawScores[c.key], 7);
+      } else if (scoresMap[c.key] === undefined) {
+        scoresMap[c.key] = 7;
+      }
+    }
+
+    const physical = clampIntScore(scoresMap.physical, 7);
+    const dribbling = clampIntScore(scoresMap.dribbling, 7);
+    const shooting = clampIntScore(scoresMap.shooting, 7);
+    const defense = clampIntScore(scoresMap.defense, 7);
+    const attack = clampIntScore(scoresMap.attack, 7);
+    const passing = clampIntScore(scoresMap.passing, 7);
+    const positioning = clampIntScore(scoresMap.positioning, 7);
+    const averageScore = computeWeightedOverall(scoresMap, criteriaConfig);
+    const scoresJson = JSON.stringify(scoresMap);
+    const comment = String(req.body?.comment ?? '').trim().slice(0, 400) || null;
+
+    const existing = await db
+      .select()
+      .from(playerEvaluations)
+      .where(
+        and(
+          eq(playerEvaluations.peladaId, peladaId),
+          isNull(playerEvaluations.matchId),
+          eq(playerEvaluations.playerId, playerId),
+          eq(playerEvaluations.evaluatorUserId, authUser.id)
+        )
+      )
+      .limit(1);
+
+    let savedRow: typeof playerEvaluations.$inferSelect;
+    if (existing.length > 0) {
+      const updated = await db
+        .update(playerEvaluations)
+        .set({
+          physical,
+          dribbling,
+          shooting,
+          defense,
+          attack,
+          passing,
+          positioning,
+          scoresJson,
+          averageScore,
+          comment,
+        })
+        .where(eq(playerEvaluations.id, existing[0].id))
+        .returning();
+      savedRow = updated[0];
+    } else {
+      const inserted = await db
+        .insert(playerEvaluations)
+        .values({
+          matchId: null,
+          peladaId,
+          playerId,
+          evaluatorUserId: authUser.id,
+          physical,
+          dribbling,
+          shooting,
+          defense,
+          attack,
+          passing,
+          positioning,
+          scoresJson,
+          averageScore,
+          comment,
+        })
+        .returning();
+      savedRow = inserted[0];
+    }
+
+    const updatedPlayer = await recalculatePlayerRatings(playerId, {
+      groupId: pelada.groupId,
+      criteriaOverride: criteriaConfig,
+    });
+    res.status(201).json({ evaluation: savedRow, player: updatedPlayer });
+  } catch (error) {
+    console.error('Erro ao salvar avaliação do encontro:', error);
+    res.status(500).json({ error: 'Falha ao registrar avaliação do jogador neste encontro.' });
   }
 });
 

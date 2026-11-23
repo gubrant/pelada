@@ -1,23 +1,30 @@
 import { useState } from 'react';
-import { KeyRound, LogIn, Mail, User, UserPlus } from 'lucide-react';
+import { CalendarDays, KeyRound, LogIn, MapPin, ShieldCheck, User, UserPlus, X } from 'lucide-react';
 import { apiFetch, setInMemoryAuthToken } from '../lib/api';
-import { type AuthUser, type Player } from '../types/futsal';
+import { type AuthUser, type PeladaGroupSummary, type Player } from '../types/futsal';
 
-interface AuthSuccessPayload {
+export interface AuthSuccessPayload {
   token: string;
   user: AuthUser;
   player: Player | null;
+  groupAccess?: {
+    allowed: boolean;
+    reason?: string;
+    expiredAt?: string | null;
+  } | null;
 }
 
-interface AuthViewProps {
+interface AuthModalProps {
+  targetGroup?: PeladaGroupSummary | null;
+  onClose: () => void;
   onAuthSuccess: (payload: AuthSuccessPayload) => void;
 }
 
-export function AuthView({ onAuthSuccess }: AuthViewProps) {
+export function AuthModal({ targetGroup = null, onClose, onAuthSuccess }: AuthModalProps) {
   const [mode, setMode] = useState<'login' | 'register'>('login');
 
-  // Login states
-  const [email, setEmail] = useState('');
+  // Login states (aceita usuário simples ou e-mail)
+  const [loginId, setLoginId] = useState('');
   const [password, setPassword] = useState('');
 
   // Self-registration states
@@ -32,9 +39,9 @@ export function AuthView({ onAuthSuccess }: AuthViewProps) {
   async function handlePasswordLogin(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
-    const trimmedEmail = email.trim().toLowerCase();
-    if (!trimmedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail)) {
-      setError('Informe um e-mail válido.');
+    const trimmedLogin = loginId.trim().toLowerCase();
+    if (!trimmedLogin || trimmedLogin.length < 3 || /\s/.test(trimmedLogin)) {
+      setError('Informe um login válido (mínimo 3 caracteres, sem espaços).');
       return;
     }
     if (!password) {
@@ -45,12 +52,16 @@ export function AuthView({ onAuthSuccess }: AuthViewProps) {
     try {
       const res = await apiFetch<AuthSuccessPayload>('/api/auth/login', {
         method: 'POST',
-        body: JSON.stringify({ email: trimmedEmail, password }),
+        body: JSON.stringify({
+          login: trimmedLogin,
+          password,
+          groupId: targetGroup?.id ?? null,
+        }),
       });
       setInMemoryAuthToken(res.token);
       onAuthSuccess(res);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'E-mail ou senha inválidos.');
+      setError(err instanceof Error ? err.message : 'Login ou senha inválidos.');
     } finally {
       setLoading(false);
     }
@@ -61,7 +72,7 @@ export function AuthView({ onAuthSuccess }: AuthViewProps) {
     setError(null);
     const trimmedEmail = regEmail.trim().toLowerCase();
     if (!trimmedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail)) {
-      setError('Informe um e-mail válido para o login.');
+      setError('Informe um e-mail válido para criar sua conta.');
       return;
     }
     if (regPassword.length < 6) {
@@ -92,71 +103,52 @@ export function AuthView({ onAuthSuccess }: AuthViewProps) {
   }
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-900 grid lg:grid-cols-12">
-      <div className="relative hidden lg:flex lg:col-span-6 flex-col justify-between overflow-hidden bg-slate-900 p-10 text-white">
-        <img
-          src="/src/assets/images/futsal_court_hero_1795299371438.jpg"
-          alt="Quadra de futsal iluminada"
-          referrerPolicy="no-referrer"
-          className="absolute inset-0 h-full w-full object-cover"
-        />
-        <div className="absolute inset-0 bg-gradient-to-t from-slate-950/90 via-slate-950/55 to-slate-950/35" />
-
-        <div className="relative z-10 flex items-center gap-3">
-          <img
-            src="/src/assets/images/futsal_ball_emblem_1795299371507.jpg"
-            alt="Emblema QuadraMestre"
-            referrerPolicy="no-referrer"
-            className="h-10 w-10 rounded-lg object-cover border border-white/20"
-          />
-          <span className="font-display text-2xl font-bold tracking-wide text-white">
-            QuadraMestre
-          </span>
-        </div>
-
-        <div className="relative z-10 max-w-lg space-y-6">
-          <h1 className="font-display text-5xl font-extrabold leading-[1.02] tracking-tight text-balance">
-            O controle completo da sua pelada de futsal.
-          </h1>
-          <p className="text-base text-slate-200 leading-relaxed">
-            Separe times equilibrados por nota e posição, registre gols e assistências em tempo
-            real, controle temporadas e acompanhe a evolução de cada jogador nos últimos 10 jogos.
-          </p>
-
-          <div className="grid grid-cols-2 gap-4 pt-2 border-t border-white/15 text-sm text-slate-200">
-            <div>
-              <p className="font-semibold text-white">Critérios Técnicos</p>
-              <p className="text-slate-300 text-xs mt-0.5">
-                Média móvel das últimas 10 partidas avaliadas pelos próprios peladeiros.
-              </p>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 p-4 overflow-y-auto"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-md rounded-2xl bg-white border border-slate-200 shadow-2xl overflow-hidden my-6"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="bg-slate-900 px-6 py-5 text-white flex items-start justify-between gap-4">
+          <div className="space-y-1 min-w-0">
+            <div className="flex items-center gap-2 text-emerald-400 text-xs font-semibold">
+              <ShieldCheck className="h-4 w-4 shrink-0" />
+              <span>{targetGroup ? 'Acesso à Pelada Fixa' : 'Acesso ao QuadraMestre'}</span>
             </div>
-            <div>
-              <p className="font-semibold text-white">Placar, Caixa e Ranking</p>
-              <p className="text-slate-300 text-xs mt-0.5">
-                Artilheiro, Rei das Assistências, Melhor Defensor, Assiduidade e Financeiro.
-              </p>
-            </div>
-          </div>
-        </div>
-
-        <p className="relative z-10 text-xs text-slate-400">
-          Acesso direto com login e senha · Banco relacional PostgreSQL.
-        </p>
-      </div>
-
-      <div className="lg:col-span-6 bg-slate-50 flex items-center justify-center p-6 sm:p-10">
-        <div className="w-full max-w-md bg-white border border-slate-200 rounded-xl p-6 sm:p-8">
-          <div className="mb-6">
-            <h2 className="font-display text-3xl font-bold text-slate-900">
-              {mode === 'login' ? 'Entrar na Quadra' : 'Criar Login e Senha'}
+            <h2 className="font-display text-2xl font-bold leading-tight truncate">
+              {targetGroup ? targetGroup.name : mode === 'login' ? 'Entrar na Quadra' : 'Criar Conta'}
             </h2>
-            <p className="text-sm text-slate-500 mt-1">
-              {mode === 'login'
-                ? 'Informe seu e-mail e senha para acessar suas peladas.'
-                : 'Crie seu acesso na hora com um e-mail válido e senha de no mínimo 6 dígitos.'}
-            </p>
+            {targetGroup ? (
+              <p className="text-xs text-slate-300 flex flex-wrap items-center gap-x-3 gap-y-0.5">
+                <span className="inline-flex items-center gap-1">
+                  <CalendarDays className="h-3 w-3 text-emerald-400" />
+                  {targetGroup.weekday} · {targetGroup.startTime} às {targetGroup.endTime}
+                </span>
+                <span className="inline-flex items-center gap-1">
+                  <MapPin className="h-3 w-3 text-emerald-400" />
+                  {targetGroup.location}
+                </span>
+              </p>
+            ) : (
+              <p className="text-xs text-slate-300">
+                Use o login e senha fornecidos pelo organizador da pelada ou sua conta.
+              </p>
+            )}
           </div>
 
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-white cursor-pointer shrink-0"
+            aria-label="Fechar janela de login"
+          >
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        <div className="p-6">
           <div className="grid grid-cols-2 gap-2 rounded-lg bg-slate-100 p-1 mb-5">
             <button
               type="button"
@@ -198,23 +190,26 @@ export function AuthView({ onAuthSuccess }: AuthViewProps) {
             <form onSubmit={handlePasswordLogin} className="space-y-4">
               <div>
                 <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  E-mail (Login)
+                  Login (usuário ou e-mail) *
                 </label>
                 <div className="relative">
-                  <Mail className="h-4 w-4 text-slate-400 absolute left-3 top-2.5" />
+                  <User className="h-4 w-4 text-slate-400 absolute left-3 top-2.5" />
                   <input
-                    type="email"
+                    type="text"
                     required
-                    value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                    placeholder="seu@email.com"
+                    autoFocus
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                    value={loginId}
+                    onChange={(e) => setLoginId(e.target.value)}
+                    placeholder="Ex: joao.silva ou seu@email.com"
                     className="w-full rounded-lg border border-slate-300 pl-9 pr-3 py-2 text-sm focus:border-emerald-600 focus:outline-none"
                   />
                 </div>
               </div>
 
               <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">Senha</label>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">Senha *</label>
                 <div className="relative">
                   <KeyRound className="h-4 w-4 text-slate-400 absolute left-3 top-2.5" />
                   <input
@@ -231,10 +226,14 @@ export function AuthView({ onAuthSuccess }: AuthViewProps) {
               <button
                 type="submit"
                 disabled={loading}
-                className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white hover:bg-slate-800 disabled:opacity-60 transition-colors cursor-pointer"
+                className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-60 transition-colors cursor-pointer"
               >
                 <LogIn className="h-4 w-4" />
-                {loading ? 'Entrando...' : 'Entrar'}
+                {loading
+                  ? 'Verificando acesso...'
+                  : targetGroup
+                    ? 'Entrar na Pelada'
+                    : 'Entrar'}
               </button>
             </form>
           ) : (
@@ -261,7 +260,7 @@ export function AuthView({ onAuthSuccess }: AuthViewProps) {
                   E-mail válido (será seu login) *
                 </label>
                 <div className="relative">
-                  <Mail className="h-4 w-4 text-slate-400 absolute left-3 top-2.5" />
+                  <User className="h-4 w-4 text-slate-400 absolute left-3 top-2.5" />
                   <input
                     type="email"
                     required

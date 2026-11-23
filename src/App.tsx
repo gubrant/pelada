@@ -9,6 +9,7 @@ import {
   Clock,
   Edit3,
   KeyRound,
+  LogIn,
   LogOut,
   Mail,
   MapPin,
@@ -23,7 +24,7 @@ import {
   Wallet,
 } from 'lucide-react';
 import { AdminAccessView } from './components/AdminAccessView';
-import { AuthView } from './components/AuthView';
+import { AuthModal, type AuthSuccessPayload } from './components/AuthView';
 import { CriteriaConfigModal } from './components/CriteriaConfigModal';
 import { ImageCaptureField } from './components/ImageCaptureField';
 import { InitialRatingVoteModal } from './components/InitialRatingVoteModal';
@@ -88,6 +89,10 @@ export default function App() {
   const [players, setPlayers] = useState<Player[]>([]);
   const [allSystemPlayers, setAllSystemPlayers] = useState<Player[]>([]);
 
+  const [loginModalState, setLoginModalState] = useState<{
+    targetGroup: PeladaGroupSummary | null;
+  } | null>(null);
+
   // New Fixed Pelada (Group) form
   const [showNewGroupForm, setShowNewGroupForm] = useState(false);
   const [groupName, setGroupName] = useState('');
@@ -96,6 +101,7 @@ export default function App() {
   const [groupAvulsoFee, setGroupAvulsoFee] = useState('0');
   const [groupWeekday, setGroupWeekday] = useState('Quarta-feira');
   const [groupStartTime, setGroupStartTime] = useState('20:00');
+  const [groupEndTime, setGroupEndTime] = useState('22:00');
   const [groupPerTeam, setGroupPerTeam] = useState(5);
   const [groupTeamsCount, setGroupTeamsCount] = useState('2');
   const [groupDescription, setGroupDescription] = useState('');
@@ -111,6 +117,8 @@ export default function App() {
   const [editGroupLocation, setEditGroupLocation] = useState('');
   const [editGroupFullAddress, setEditGroupFullAddress] = useState('');
   const [editGroupAvulsoFee, setEditGroupAvulsoFee] = useState('0');
+  const [editGroupStartTime, setEditGroupStartTime] = useState('20:00');
+  const [editGroupEndTime, setEditGroupEndTime] = useState('22:00');
   const [savingGroupInfo, setSavingGroupInfo] = useState(false);
 
   // New Encontro (Pelada session) form inside a Fixed Pelada
@@ -119,6 +127,7 @@ export default function App() {
   const [peladaLocation, setPeladaLocation] = useState('Quadra Central');
   const [peladaDate, setPeladaDate] = useState(new Date().toISOString().slice(0, 10));
   const [peladaTime, setPeladaTime] = useState('20:00');
+  const [peladaEndTime, setPeladaEndTime] = useState('22:00');
   const [peladaPerTeam, setPeladaPerTeam] = useState(5);
   const [peladaTeamsCount, setPeladaTeamsCount] = useState('2');
 
@@ -160,6 +169,12 @@ export default function App() {
   const [appError, setAppError] = useState<string | null>(null);
 
 
+
+  const loadPublicGroups = useCallback(async () => {
+    const list = await apiFetch<PeladaGroupSummary[]>('/api/public/groups');
+    setGroups(list);
+    return list;
+  }, []);
 
   const loadGroups = useCallback(async () => {
     const list = await apiFetch<PeladaGroupSummary[]>('/api/groups');
@@ -219,17 +234,34 @@ export default function App() {
     }
   }, []);
 
-  // Load user's fixed peladas right upon authentication
+  // Load public fixed peladas on initial screen or user's authorized peladas after login
   useEffect(() => {
-    if (!authUser) return;
     setLoadingGroups(true);
     setAppError(null);
+    if (!authUser) {
+      loadPublicGroups()
+        .catch((err: unknown) => {
+          setAppError(
+            err instanceof Error ? err.message : 'Erro ao carregar peladas fixas cadastradas.'
+          );
+        })
+        .finally(() => setLoadingGroups(false));
+      return;
+    }
+
     Promise.all([loadGroups(), loadAllSystemPlayers(), loadNotifications(), loadSummaryEmails()])
       .catch((err: unknown) => {
         setAppError(err instanceof Error ? err.message : 'Erro ao carregar peladas fixas.');
       })
       .finally(() => setLoadingGroups(false));
-  }, [authUser, loadGroups, loadAllSystemPlayers, loadNotifications, loadSummaryEmails]);
+  }, [
+    authUser,
+    loadPublicGroups,
+    loadGroups,
+    loadAllSystemPlayers,
+    loadNotifications,
+    loadSummaryEmails,
+  ]);
 
   // Load scoped data whenever user enters a fixed pelada
   useEffect(() => {
@@ -246,11 +278,14 @@ export default function App() {
     if (g) {
       setPeladaLocation(g.location);
       setPeladaTime(g.startTime);
+      setPeladaEndTime(g.endTime || '22:00');
       setPeladaPerTeam(g.playersPerTeam);
       setPeladaTeamsCount(String(g.defaultTeamsCount));
       setEditGroupLocation(g.location);
       setEditGroupFullAddress(g.fullAddress ?? '');
       setEditGroupAvulsoFee(String(g.avulsoFee ?? 0));
+      setEditGroupStartTime(g.startTime || '20:00');
+      setEditGroupEndTime(g.endTime || '22:00');
     }
 
     setLoadingData(true);
@@ -290,14 +325,37 @@ export default function App() {
     setShowNewSeasonInline(false);
     setEditingGroupInfo(false);
     setAppError(null);
-    loadGroups().catch(() => {});
+    if (authUser) {
+      loadGroups().catch(() => {});
+    } else {
+      loadPublicGroups().catch(() => {});
+    }
+  }
+
+  function handleAuthSuccess(payload: AuthSuccessPayload) {
+    const targetGroup = loginModalState?.targetGroup ?? null;
+    setInMemoryAuthToken(payload.token);
+    setAuthUser(payload.user);
+    setMyPlayer(payload.player);
+    setLoginModalState(null);
+    setAppError(null);
+
+    if (targetGroup) {
+      if (payload.groupAccess && !payload.groupAccess.allowed) {
+        setAppError(
+          payload.groupAccess.reason ||
+            `Seu login não possui acesso ativo para "${targetGroup.name}".`
+        );
+      } else {
+        openFixedPelada(targetGroup.id, 'peladas');
+      }
+    }
   }
 
   function handleLogout() {
     setInMemoryAuthToken(null);
     setAuthUser(null);
     setMyPlayer(null);
-    setGroups([]);
     setNotifications([]);
     setSummaryEmails([]);
     setShowNotificationsPanel(false);
@@ -309,6 +367,7 @@ export default function App() {
     setActiveGroupId(null);
     setActivePeladaId(null);
     setEditingGroupInfo(false);
+    setAppError(null);
   }
 
   async function handleCreateGroup(e: React.FormEvent) {
@@ -334,6 +393,7 @@ export default function App() {
           avulsoFee: Number.isFinite(parsedFee) && parsedFee >= 0 ? parsedFee : 0,
           weekday: groupWeekday,
           startTime: groupStartTime,
+          endTime: groupEndTime,
           playersPerTeam: groupPerTeam,
           defaultTeamsCount: parsedTeams,
           description: groupDescription || null,
@@ -374,6 +434,8 @@ export default function App() {
           location: editGroupLocation.trim() || 'Quadra Principal',
           fullAddress: editGroupFullAddress.trim() || null,
           avulsoFee: Number.isFinite(parsedFee) && parsedFee >= 0 ? parsedFee : 0,
+          startTime: editGroupStartTime,
+          endTime: editGroupEndTime,
         }),
       });
       setEditingGroupInfo(false);
@@ -431,6 +493,7 @@ export default function App() {
           location: peladaLocation,
           eventDate: peladaDate,
           startTime: peladaTime,
+          endTime: peladaEndTime,
           playersPerTeam: peladaPerTeam,
           teamCount: parsedTeamsCount,
         }),
@@ -460,21 +523,10 @@ export default function App() {
     }
   }
 
-  if (!authUser) {
-    return (
-      <AuthView
-        onAuthSuccess={(payload) => {
-          setAuthUser(payload.user);
-          setMyPlayer(payload.player);
-        }}
-      />
-    );
-  }
-
-  const isAdmin = authUser.role === 'admin';
-  const activeGroup = groups.find((g) => g.id === activeGroupId) ?? null;
-  const isPeladaAdmin = isAdmin || activeGroup?.isGroupAdmin === true;
-  const hasAnyAdminGroup = isAdmin || groups.some((g) => g.isGroupAdmin);
+  const isAdmin = authUser?.role === 'admin';
+  const activeGroup = authUser ? (groups.find((g) => g.id === activeGroupId) ?? null) : null;
+  const isPeladaAdmin = Boolean(authUser && (isAdmin || activeGroup?.isGroupAdmin === true));
+  const hasAnyAdminGroup = Boolean(authUser && (isAdmin || groups.some((g) => g.isGroupAdmin)));
   const pendingNotifications = notifications.filter((n) => !n.voted);
   const activeGroupCriteria = (
     activeGroup?.criteriaConfig && activeGroup.criteriaConfig.length > 0
@@ -533,11 +585,11 @@ export default function App() {
               <SidebarButton
                 active
                 icon={<CalendarDays className="h-4 w-4" />}
-                label="Minhas Peladas Fixas"
+                label={authUser ? 'Minhas Peladas Fixas' : 'Peladas Fixas'}
                 onClick={() => setActiveGroupId(null)}
               />
 
-              {groups.some((g) => (g.membershipStatus ?? 'member') === 'member') && (
+              {authUser && groups.some((g) => (g.membershipStatus ?? 'member') === 'member') && (
                 <div className="pt-4 mt-4 border-t border-slate-800 space-y-1">
                   <p className="px-3 pb-1 text-[11px] font-semibold uppercase tracking-wider text-slate-500">
                     Acesso Rápido
@@ -575,7 +627,7 @@ export default function App() {
                 </p>
                 <p className="text-sm font-bold text-white truncate">{activeGroup.name}</p>
                 <p className="text-[11px] text-slate-400 truncate">
-                  {activeGroup.weekday} · {activeGroup.startTime}
+                  {activeGroup.weekday} · {activeGroup.startTime} às {activeGroup.endTime}
                 </p>
               </div>
 
@@ -631,34 +683,47 @@ export default function App() {
         </nav>
 
         <div className="p-4 border-t border-slate-800 space-y-3">
-          <button
-            type="button"
-            onClick={() => setShowMyProfile(true)}
-            className="w-full flex items-center gap-2.5 rounded-lg p-2 hover:bg-slate-800 text-left transition-colors cursor-pointer"
-          >
-            <PlayerAvatar
-              name={myPlayer?.name ?? authUser.name}
-              photoUrl={myPlayer?.photoUrl}
-              size="sm"
-            />
-            <div className="min-w-0 flex-1">
-              <p className="text-xs font-semibold text-white truncate">
-                {myPlayer?.nickname ?? authUser.name}
-              </p>
-              <p className="text-[11px] text-slate-400 truncate">
-                {isAdmin ? 'Administrador' : 'Peladeiro'} · Editar ficha
-              </p>
-            </div>
-          </button>
+          {authUser ? (
+            <>
+              <button
+                type="button"
+                onClick={() => setShowMyProfile(true)}
+                className="w-full flex items-center gap-2.5 rounded-lg p-2 hover:bg-slate-800 text-left transition-colors cursor-pointer"
+              >
+                <PlayerAvatar
+                  name={myPlayer?.name ?? authUser.name}
+                  photoUrl={myPlayer?.photoUrl}
+                  size="sm"
+                />
+                <div className="min-w-0 flex-1">
+                  <p className="text-xs font-semibold text-white truncate">
+                    {myPlayer?.nickname ?? authUser.name}
+                  </p>
+                  <p className="text-[11px] text-slate-400 truncate">
+                    {isAdmin ? 'Administrador' : 'Peladeiro'} · Editar ficha
+                  </p>
+                </div>
+              </button>
 
-          <button
-            type="button"
-            onClick={handleLogout}
-            className="w-full inline-flex items-center justify-center gap-2 rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-slate-800 hover:text-white cursor-pointer"
-          >
-            <LogOut className="h-3.5 w-3.5" />
-            Sair da conta
-          </button>
+              <button
+                type="button"
+                onClick={handleLogout}
+                className="w-full inline-flex items-center justify-center gap-2 rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-slate-800 hover:text-white cursor-pointer"
+              >
+                <LogOut className="h-3.5 w-3.5" />
+                Sair da conta
+              </button>
+            </>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setLoginModalState({ targetGroup: null })}
+              className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-emerald-600 px-3 py-2.5 text-xs font-semibold text-white hover:bg-emerald-500 cursor-pointer"
+            >
+              <LogIn className="h-4 w-4" />
+              Entrar com Login
+            </button>
+          )}
         </div>
       </aside>
 
@@ -675,7 +740,7 @@ export default function App() {
               onClick={backToFixedPeladasList}
               className="text-slate-400 hover:text-slate-800 hidden lg:inline cursor-pointer whitespace-nowrap"
             >
-              Minhas Peladas Fixas
+              {authUser ? 'Minhas Peladas Fixas' : 'Peladas Fixas'}
             </button>
             {activeGroup ? (
               <>
@@ -692,7 +757,7 @@ export default function App() {
               <>
                 <span className="text-slate-300 hidden lg:inline">/</span>
                 <span className="font-semibold text-slate-900 truncate lg:hidden">
-                  Minhas Peladas Fixas
+                  {authUser ? 'Minhas Peladas Fixas' : 'Peladas Fixas'}
                 </span>
               </>
             )}
@@ -916,7 +981,16 @@ export default function App() {
               </div>
             )}
 
-            {activeGroup === null ? (
+            {!authUser ? (
+              <button
+                type="button"
+                onClick={() => setLoginModalState({ targetGroup: null })}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-emerald-700 whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <LogIn className="h-4 w-4" />
+                Entrar / Login
+              </button>
+            ) : activeGroup === null ? (
               isAdmin ? (
                 <button
                   type="button"
@@ -967,7 +1041,7 @@ export default function App() {
         </header>
 
         <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-8 py-6 space-y-6">
-          {!myPlayer?.profileCompleted && (
+          {authUser && !myPlayer?.profileCompleted && (
             <div className="rounded-xl border border-amber-200 bg-amber-50 px-5 py-3.5 flex flex-wrap items-center justify-between gap-3">
               <p className="text-xs sm:text-sm text-amber-900">
                 Complete sua ficha de peladeiro com apelido, foto de perfil, idade, posição e pé
@@ -983,15 +1057,13 @@ export default function App() {
             </div>
           )}
 
-
-
           {appError && (
             <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
               {appError}
             </div>
           )}
 
-          {/* LEVEL 1: ENTRY SCREEN — USER'S FIXED PELADAS */}
+          {/* LEVEL 1: ENTRY SCREEN — FIXED PELADAS */}
           {activeGroup === null ? (
             <div className="space-y-6">
               {/* Hero Header for Fixed Peladas */}
@@ -1007,21 +1079,36 @@ export default function App() {
                 <div className="relative z-10 p-6 sm:p-8 flex flex-wrap items-end justify-between gap-6">
                   <div className="max-w-xl space-y-2">
                     <p className="text-xs font-semibold text-emerald-400">
-                      Olá, {myPlayer?.nickname ?? authUser.name} ·{' '}
-                      {groups.filter((g) => (g.membershipStatus ?? 'member') === 'member').length}{' '}
-                      pelada(s) ativa(s) · {groups.length} no total
+                      {authUser
+                        ? `Olá, ${myPlayer?.nickname ?? authUser.name} · ${
+                            groups.filter((g) => (g.membershipStatus ?? 'member') === 'member')
+                              .length
+                          } pelada(s) ativa(s) · ${groups.length} no total`
+                        : `${groups.length} pelada(s) fixa(s) cadastrada(s) · Escolha a sua para entrar`}
                     </p>
                     <h1 className="font-display text-4xl sm:text-5xl font-extrabold leading-none text-balance">
-                      Minhas Peladas Fixas
+                      {authUser ? 'Minhas Peladas Fixas' : 'Peladas Fixas Cadastradas'}
                     </h1>
                     <p className="text-sm text-slate-300">
-                      Entre nas suas peladas autorizadas ou solicite autorização aos administradores
-                      para participar como mensalista, avulso ou peladeiro eventual.
+                      {authUser
+                        ? 'Entre nas suas peladas autorizadas ou solicite autorização aos administradores para participar como mensalista, avulso ou peladeiro eventual.'
+                        : 'Clique na pelada fixa desejada e entre com o login e senha cadastrados pelo criador ou administrador.'}
                     </p>
                   </div>
 
                   <div className="flex flex-wrap items-center gap-2.5">
-                    {summaryEmails.length > 0 && (
+                    {!authUser && (
+                      <button
+                        type="button"
+                        onClick={() => setLoginModalState({ targetGroup: null })}
+                        className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-4 py-2.5 text-xs font-semibold text-white hover:bg-emerald-500 cursor-pointer"
+                      >
+                        <LogIn className="h-4 w-4" />
+                        Entrar com Login
+                      </button>
+                    )}
+
+                    {authUser && summaryEmails.length > 0 && (
                       <button
                         type="button"
                         onClick={() => setShowSummaryEmailsModal(true)}
@@ -1164,12 +1251,24 @@ export default function App() {
 
                     <div className="sm:col-span-1">
                       <label className="block text-xs font-semibold text-slate-700 mb-1">
-                        Horário
+                        Início
                       </label>
                       <input
                         type="time"
                         value={groupStartTime}
                         onChange={(e) => setGroupStartTime(e.target.value)}
+                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                      />
+                    </div>
+
+                    <div className="sm:col-span-1">
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">
+                        Término
+                      </label>
+                      <input
+                        type="time"
+                        value={groupEndTime}
+                        onChange={(e) => setGroupEndTime(e.target.value)}
                         className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
                       />
                     </div>
@@ -1188,9 +1287,9 @@ export default function App() {
                       />
                     </div>
 
-                    <div className="sm:col-span-2">
+                    <div className="sm:col-span-1">
                       <label className="block text-xs font-semibold text-slate-700 mb-1">
-                        Qtd. padrão de times
+                        Times
                       </label>
                       <input
                         type="number"
@@ -1282,19 +1381,32 @@ export default function App() {
 
               {loadingGroups ? (
                 <div className="py-12 text-center text-sm text-slate-500">
-                  Carregando suas peladas fixas...
+                  Carregando peladas fixas...
                 </div>
               ) : groups.length === 0 ? (
                 <div className="rounded-xl border border-dashed border-slate-300 bg-white p-10 text-center space-y-3">
                   <CalendarDays className="h-9 w-9 text-slate-400 mx-auto" />
                   <h3 className="text-base font-bold text-slate-900">
-                    Nenhuma pelada fixa vinculada ao seu usuário
+                    {authUser
+                      ? 'Nenhuma pelada fixa vinculada ao seu usuário'
+                      : 'Nenhuma pelada fixa cadastrada ainda'}
                   </h3>
                   <p className="text-sm text-slate-500 max-w-md mx-auto">
-                    {isAdmin
-                      ? 'Cadastre sua primeira pelada fixa (ex: Pelada de Quarta, Futsal de Sábado) para organizar elenco, encontros e temporadas.'
-                      : 'Peça ao administrador da sua pelada para adicionar seu usuário ou ficha de peladeiro ao grupo.'}
+                    {!authUser
+                      ? 'Entre com uma conta de administrador para cadastrar a primeira pelada fixa e liberar o acesso dos jogadores.'
+                      : isAdmin
+                        ? 'Cadastre sua primeira pelada fixa (ex: Pelada de Quarta, Futsal de Sábado) para organizar elenco, encontros e temporadas.'
+                        : 'Peça ao administrador da sua pelada para adicionar seu usuário ou ficha de peladeiro ao grupo.'}
                   </p>
+                  {!authUser && (
+                    <button
+                      type="button"
+                      onClick={() => setLoginModalState({ targetGroup: null })}
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-4 py-2 text-xs font-semibold text-white hover:bg-emerald-700 cursor-pointer"
+                    >
+                      <LogIn className="h-4 w-4" /> Entrar com Login
+                    </button>
+                  )}
                   {isAdmin && !showNewGroupForm && (
                     <button
                       type="button"
@@ -1308,8 +1420,8 @@ export default function App() {
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                   {groups.map((g) => {
-                    const status = g.membershipStatus ?? 'member';
-                    const isMember = status === 'member';
+                    const status = authUser ? (g.membershipStatus ?? 'member') : 'public';
+                    const isMember = authUser != null && status === 'member';
                     const pendingReqs = g.pendingJoinRequestsCount ?? 0;
                     const groupSummaryEmail = summaryEmails.find((se) => se.groupId === g.id);
 
@@ -1317,14 +1429,16 @@ export default function App() {
                       <div
                         key={g.id}
                         onClick={() => {
-                          if (isMember) {
+                          if (!authUser) {
+                            setLoginModalState({ targetGroup: g });
+                          } else if (isMember) {
                             openFixedPelada(g.id, 'peladas');
                           } else {
                             setJoinRequestTarget(g);
                           }
                         }}
                         className={`rounded-xl border bg-white p-5 transition-colors cursor-pointer flex flex-col justify-between gap-4 shadow-xs ${
-                          isMember
+                          !authUser || isMember
                             ? 'border-slate-200 hover:border-emerald-400'
                             : status === 'pending'
                               ? 'border-amber-200 hover:border-amber-400'
@@ -1346,7 +1460,7 @@ export default function App() {
                               <div className="min-w-0">
                                 <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700">
                                   <Clock className="h-3 w-3" />
-                                  {g.weekday} · {g.startTime}
+                                  {g.weekday} · {g.startTime} às {g.endTime}
                                 </span>
                                 <h3 className="font-display text-2xl font-bold text-slate-900 truncate">
                                   {g.name}
@@ -1354,7 +1468,11 @@ export default function App() {
                               </div>
                             </div>
 
-                            {isMember ? (
+                            {!authUser ? (
+                              <span className="text-[10px] font-bold px-2 py-0.5 rounded border border-emerald-200 bg-emerald-50 text-emerald-800 shrink-0">
+                                Login
+                              </span>
+                            ) : isMember ? (
                               <span className="text-[11px] font-semibold text-slate-500 shrink-0">
                                 {g.isGroupAdmin
                                   ? 'Organizador'
@@ -1403,11 +1521,10 @@ export default function App() {
                             {g.description && (
                               <p className="text-slate-500 line-clamp-2">{g.description}</p>
                             )}
-                            {isMember && !g.isGroupAdmin && g.myMemberCategory === 'eventual' && g.accessExpiresAt && (
+                            {isMember && !g.isGroupAdmin && g.accessExpiresAt && (
                               <p className="text-[11px] font-medium text-amber-700 pt-0.5">
-                                Acesso eventual até{' '}
-                                {new Date(g.accessExpiresAt).toLocaleDateString('pt-BR')} (3 dias
-                                após a pelada).
+                                Acesso válido até{' '}
+                                {new Date(g.accessExpiresAt).toLocaleDateString('pt-BR')}.
                               </p>
                             )}
                             {!isMember && status === 'pending' && (
@@ -1432,7 +1549,7 @@ export default function App() {
                             )}
                             {!isMember && status === 'expired' && (
                               <p className="text-[11px] text-slate-600 pt-0.5">
-                                Seu acesso eventual de 3 dias pós-pelada terminou.
+                                Seu prazo de acesso a esta pelada encerrou. Peça ao administrador para renovar.
                               </p>
                             )}
                           </div>
@@ -1448,7 +1565,16 @@ export default function App() {
                             </span>
                           </div>
 
-                          {isMember ? (
+                          {!authUser ? (
+                            <div className="flex items-center justify-between gap-2 pt-1">
+                              <span className="text-[11px] text-slate-400">
+                                Acesso por login e senha
+                              </span>
+                              <span className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-700">
+                                Acessar Pelada <ChevronRight className="h-3.5 w-3.5" />
+                              </span>
+                            </div>
+                          ) : isMember ? (
                             <div className="flex items-center justify-between gap-2 pt-1">
                               <div
                                 className="flex items-center gap-2 text-[11px] font-semibold text-slate-500"
@@ -1568,8 +1694,9 @@ export default function App() {
                         {activeGroup.name}
                       </h2>
                       <p className="text-xs text-slate-600">
-                        {activeGroup.weekday} às {activeGroup.startTime} · {activeGroup.location} ·
-                        Formato {activeGroup.playersPerTeam}×{activeGroup.playersPerTeam} · Avulso:{' '}
+                        {activeGroup.weekday} · {activeGroup.startTime} às {activeGroup.endTime} ·{' '}
+                        {activeGroup.location} · Formato {activeGroup.playersPerTeam}×
+                        {activeGroup.playersPerTeam} · Avulso:{' '}
                         <strong className="text-emerald-700">
                           {(activeGroup.avulsoFee ?? 0) > 0
                             ? formatCurrencyBrl(activeGroup.avulsoFee)
@@ -1589,12 +1716,14 @@ export default function App() {
                               setEditGroupLocation(activeGroup.location);
                               setEditGroupFullAddress(activeGroup.fullAddress ?? '');
                               setEditGroupAvulsoFee(String(activeGroup.avulsoFee ?? 0));
+                              setEditGroupStartTime(activeGroup.startTime || '20:00');
+                              setEditGroupEndTime(activeGroup.endTime || '22:00');
                               setEditingGroupInfo((v) => !v);
                             }}
                             className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 hover:text-emerald-800 cursor-pointer"
                           >
                             <Edit3 className="h-3 w-3" />
-                            {editingGroupInfo ? 'Fechar edição' : 'Editar endereço e valor'}
+                            {editingGroupInfo ? 'Fechar edição' : 'Editar informações'}
                           </button>
                         )}
                       </div>
@@ -1624,7 +1753,7 @@ export default function App() {
                 {editingGroupInfo && isPeladaAdmin && (
                   <form
                     onSubmit={handleSaveGroupInfo}
-                    className="rounded-lg border border-slate-200 bg-slate-50 p-3.5 grid grid-cols-1 sm:grid-cols-6 gap-3 items-end"
+                    className="rounded-lg border border-slate-200 bg-slate-50 p-3.5 grid grid-cols-1 sm:grid-cols-8 gap-3 items-end"
                   >
                     <div className="sm:col-span-2">
                       <label className="block text-[11px] font-semibold text-slate-700 mb-1">
@@ -1646,6 +1775,28 @@ export default function App() {
                         onChange={(e) => setEditGroupFullAddress(e.target.value)}
                         placeholder="Rua, número, bairro, cidade"
                         className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs"
+                      />
+                    </div>
+                    <div className="sm:col-span-1">
+                      <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                        Início
+                      </label>
+                      <input
+                        type="time"
+                        value={editGroupStartTime}
+                        onChange={(e) => setEditGroupStartTime(e.target.value)}
+                        className="w-full rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs"
+                      />
+                    </div>
+                    <div className="sm:col-span-1">
+                      <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                        Término
+                      </label>
+                      <input
+                        type="time"
+                        value={editGroupEndTime}
+                        onChange={(e) => setEditGroupEndTime(e.target.value)}
+                        className="w-full rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs"
                       />
                     </div>
                     <div className="sm:col-span-1">
@@ -1758,7 +1909,7 @@ export default function App() {
               </div>
 
               {/* SELECTED SCREEN INSIDE THE PELADA */}
-              {section === 'peladas' && activePeladaId !== null ? (
+              {section === 'peladas' && activePeladaId !== null && authUser ? (
                 <PeladaWorkspace
                   peladaId={activePeladaId}
                   authUser={authUser}
@@ -1951,12 +2102,23 @@ export default function App() {
                         </div>
                         <div className="sm:col-span-1">
                           <label className="block text-xs font-semibold text-slate-700 mb-1">
-                            Horário
+                            Início
                           </label>
                           <input
                             type="time"
                             value={peladaTime}
                             onChange={(e) => setPeladaTime(e.target.value)}
+                            className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                          />
+                        </div>
+                        <div className="sm:col-span-1">
+                          <label className="block text-xs font-semibold text-slate-700 mb-1">
+                            Término
+                          </label>
+                          <input
+                            type="time"
+                            value={peladaEndTime}
+                            onChange={(e) => setPeladaEndTime(e.target.value)}
                             className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
                           />
                         </div>
@@ -1973,9 +2135,9 @@ export default function App() {
                             className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
                           />
                         </div>
-                        <div className="sm:col-span-2">
+                        <div className="sm:col-span-1">
                           <label className="block text-xs font-semibold text-slate-700 mb-1">
-                            Qtd. inicial de times
+                            Times
                           </label>
                           <input
                             type="number"
@@ -2032,7 +2194,7 @@ export default function App() {
                           <div>
                             <div className="flex items-center justify-between text-xs text-slate-500 mb-1.5">
                               <span className="font-mono tabular-nums">
-                                {p.eventDate} · {p.startTime}
+                                {p.eventDate} · {p.startTime} às {p.endTime}
                               </span>
                               <span
                                 className={
@@ -2243,8 +2405,10 @@ export default function App() {
                       {filteredPlayers.map((p) => {
                         const canEdit =
                           isPeladaAdmin ||
-                          (p.userId != null && p.userId === authUser.id) ||
-                          (p.category === 'eventual' && p.invitedByUserId === authUser.id);
+                          (authUser != null && p.userId != null && p.userId === authUser.id) ||
+                          (authUser != null &&
+                            p.category === 'eventual' &&
+                            p.invitedByUserId === authUser.id);
                         const catBadgeStyle =
                           p.category === 'mensalista'
                             ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
@@ -2439,7 +2603,24 @@ export default function App() {
 
       {/* Mobile Bottom Nav */}
       <nav className="lg:hidden fixed bottom-0 inset-x-0 z-40 bg-white border-t border-slate-200 flex items-center justify-around h-14 px-2">
-        {activeGroup === null ? (
+        {!authUser ? (
+          <>
+            <button
+              type="button"
+              onClick={() => setActiveGroupId(null)}
+              className="flex flex-col items-center text-[11px] font-semibold text-emerald-700"
+            >
+              <CalendarDays className="h-4 w-4 mb-0.5" /> Peladas Fixas
+            </button>
+            <button
+              type="button"
+              onClick={() => setLoginModalState({ targetGroup: null })}
+              className="flex flex-col items-center text-[11px] font-semibold text-slate-700"
+            >
+              <LogIn className="h-4 w-4 mb-0.5 text-emerald-700" /> Entrar com Login
+            </button>
+          </>
+        ) : activeGroup === null ? (
           <>
             <button
               type="button"
@@ -2598,7 +2779,7 @@ export default function App() {
         />
       )}
 
-      {showMyProfile && (
+      {showMyProfile && authUser && (
         <MyProfileModal
           authUser={authUser}
           player={myPlayer}
@@ -2616,7 +2797,7 @@ export default function App() {
         />
       )}
 
-      {joinRequestTarget && (
+      {joinRequestTarget && authUser && (
         <JoinPeladaRequestModal
           group={joinRequestTarget}
           authUser={authUser}
@@ -2653,6 +2834,14 @@ export default function App() {
         <SummaryEmailsModal
           emails={summaryEmails}
           onClose={() => setShowSummaryEmailsModal(false)}
+        />
+      )}
+
+      {loginModalState !== null && (
+        <AuthModal
+          targetGroup={loginModalState.targetGroup}
+          onClose={() => setLoginModalState(null)}
+          onAuthSuccess={handleAuthSuccess}
         />
       )}
     </div>

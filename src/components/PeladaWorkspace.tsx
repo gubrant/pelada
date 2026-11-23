@@ -8,24 +8,29 @@ import {
   Plus,
   Shield,
   Shuffle,
+  Sliders,
   Star,
   Trash2,
   Trophy,
   Users,
+  Vote,
   Wallet,
 } from 'lucide-react';
 import { apiFetch } from '../lib/api';
-import type {
-  AuthUser,
-  GroupCriterion,
-  Match,
-  PeladaAttendance,
-  PeladaStats,
-  PeladaSummary,
-  PeladaTeam,
-  Player,
-  PlayerCategory,
+import {
+  DEFAULT_GROUP_CRITERIA,
+  type AuthUser,
+  type GroupCriterion,
+  type Match,
+  type PeladaAttendance,
+  type PeladaStats,
+  type PeladaSummary,
+  type PeladaTeam,
+  type Player,
+  type PlayerCategory,
 } from '../types/futsal';
+import { CriteriaConfigModal } from './CriteriaConfigModal';
+import { EncounterEvaluationModal } from './EncounterEvaluationModal';
 import { EvaluationModal } from './EvaluationModal';
 import { PeladaFinanceView } from './PeladaFinanceView';
 import { PlayerAvatar } from './PlayerAvatar';
@@ -93,8 +98,10 @@ export function PeladaWorkspace({
   const [newTeamName, setNewTeamName] = useState('');
   const [newTeamColor, setNewTeamColor] = useState('#2563EB');
 
-  // Evaluation modal
+  // Evaluation & per-encounter criteria modals
   const [evaluatingMatch, setEvaluatingMatch] = useState<Match | null>(null);
+  const [showEncounterEval, setShowEncounterEval] = useState(false);
+  const [showPeladaCriteriaModal, setShowPeladaCriteriaModal] = useState(false);
 
   async function loadDetail() {
     try {
@@ -387,8 +394,8 @@ export function PeladaWorkspace({
           </button>
           <h2 className="font-display text-3xl font-extrabold text-slate-900">{pelada.title}</h2>
           <p className="text-xs text-slate-500">
-            {pelada.location} · {pelada.eventDate} às {pelada.startTime} · Formato{' '}
-            {pelada.playersPerTeam}×{pelada.playersPerTeam} · {presentAttendances.length}{' '}
+            {pelada.location} · {pelada.eventDate} · {pelada.startTime} às {pelada.endTime} ·
+            Formato {pelada.playersPerTeam}×{pelada.playersPerTeam} · {presentAttendances.length}{' '}
             confirmados ·{' '}
             <span className="font-semibold text-emerald-700">
               {pelada.status === 'finished' ? 'Finalizada' : 'Em andamento'}
@@ -397,6 +404,26 @@ export function PeladaWorkspace({
         </div>
 
         <div className="flex flex-wrap items-center gap-2.5">
+          {authUser.playerId != null && (
+            <button
+              type="button"
+              onClick={() => setShowEncounterEval(true)}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-200 bg-emerald-50 px-3.5 py-2 text-xs font-semibold text-emerald-800 hover:bg-emerald-100 cursor-pointer"
+            >
+              <Vote className="h-3.5 w-3.5" />
+              Avaliar Jogadores do Encontro
+            </button>
+          )}
+          {isAdmin && pelada.groupId != null && (
+            <button
+              type="button"
+              onClick={() => setShowPeladaCriteriaModal(true)}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 cursor-pointer"
+            >
+              <Sliders className="h-3.5 w-3.5 text-emerald-700" />
+              Critérios deste Encontro
+            </button>
+          )}
           {authUser.playerId && (
             <button
               type="button"
@@ -1306,6 +1333,33 @@ export function PeladaWorkspace({
           criteriaConfig={detail.criteriaConfig}
           onClose={() => setEvaluatingMatch(null)}
           onEvaluated={() => {
+            loadDetail();
+            onRefreshPlayers();
+          }}
+        />
+      )}
+
+      {showEncounterEval && (
+        <EncounterEvaluationModal
+          pelada={pelada}
+          onClose={() => setShowEncounterEval(false)}
+          onEvaluated={() => {
+            loadDetail();
+            onRefreshPlayers();
+          }}
+        />
+      )}
+
+      {showPeladaCriteriaModal && pelada.groupId != null && (
+        <CriteriaConfigModal
+          groupId={pelada.groupId}
+          groupName={pelada.title}
+          peladaId={pelada.id}
+          peladaTitle={pelada.title}
+          initialCriteria={detail.criteriaConfig ?? DEFAULT_GROUP_CRITERIA}
+          onClose={() => setShowPeladaCriteriaModal(false)}
+          onSaved={() => {
+            setShowPeladaCriteriaModal(false);
             loadDetail();
             onRefreshPlayers();
           }}

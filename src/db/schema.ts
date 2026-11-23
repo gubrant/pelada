@@ -70,6 +70,7 @@ export const peladaGroups = pgTable('pelada_groups', {
   description: text('description'),
   weekday: text('weekday').notNull().default('Quarta-feira'),
   startTime: text('start_time').notNull().default('20:00'),
+  endTime: text('end_time').notNull().default('22:00'),
   location: text('location').notNull().default('Quadra Principal'),
   fullAddress: text('full_address'),
   avulsoFee: doublePrecision('avulso_fee').notNull().default(0),
@@ -131,9 +132,11 @@ export const peladas = pgTable('peladas', {
   location: text('location').notNull(),
   eventDate: text('event_date').notNull(),
   startTime: text('start_time').notNull().default('20:00'),
+  endTime: text('end_time').notNull().default('22:00'),
   playersPerTeam: integer('players_per_team').notNull().default(5),
   status: text('status').notNull().default('in_progress'), // 'scheduled' | 'in_progress' | 'finished'
   notes: text('notes'),
+  criteriaConfig: text('criteria_config'),
   createdByUserId: integer('created_by_user_id').references(() => users.id, { onDelete: 'set null' }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
@@ -220,8 +223,7 @@ export const playerEvaluations = pgTable(
   {
     id: serial('id').primaryKey(),
     matchId: integer('match_id')
-      .references(() => matches.id, { onDelete: 'cascade' })
-      .notNull(),
+      .references(() => matches.id, { onDelete: 'cascade' }),
     peladaId: integer('pelada_id')
       .references(() => peladas.id, { onDelete: 'cascade' })
       .notNull(),
