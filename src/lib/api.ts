@@ -1,77 +1,42 @@
-let inMemoryToken: string | null = null;
+let memoryAuthToken: string | null = null;
 
-export function setInMemoryAuthToken(token: string | null) {
-  inMemoryToken = token;
+export function setAuthToken(token: string | null): void {
+  memoryAuthToken = token;
 }
 
-export function getInMemoryAuthToken(): string | null {
-  return inMemoryToken;
+export function getAuthToken(): string | null {
+  return memoryAuthToken;
 }
 
-export async function apiFetch<T = unknown>(
-  url: string,
-  options: RequestInit = {}
-): Promise<T> {
-  const token = inMemoryToken;
-
-  const headers = new Headers(options.headers || {});
-  if (!headers.has('Content-Type') && options.body && !(options.body instanceof FormData)) {
+export async function apiFetch<T>(url: string, init: RequestInit = {}): Promise<T> {
+  const headers = new Headers(init.headers);
+  if (!headers.has('Content-Type') && init.body) {
     headers.set('Content-Type', 'application/json');
   }
-  if (token) {
-    headers.set('Authorization', `Bearer ${token}`);
+  if (memoryAuthToken && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${memoryAuthToken}`);
   }
 
-  const res = await fetch(url, {
-    ...options,
+  const response = await fetch(url, {
+    ...init,
     headers,
   });
 
-  const text = await res.text();
-  let data: Record<string, unknown> = {};
-  if (text) {
+  if (!response.ok) {
+    let message = `Erro na requisição (${response.status})`;
+    const text = await response.text().catch(() => '');
     try {
-      data = JSON.parse(text);
+      const payload = JSON.parse(text) as { error?: string };
+      if (payload?.error) message = payload.error;
     } catch {
-      data = { error: text };
+      if (response.status === 404) {
+        message = 'Rota da API não encontrada no servidor (404).';
+      } else if (text && text.length < 200 && !text.trim().startsWith('<')) {
+        message = text;
+      }
     }
+    throw new Error(message);
   }
 
-  if (!res.ok) {
-    throw new Error(
-      typeof data.error === 'string' && data.error
-        ? data.error
-        : `Erro na requisição (${res.status})`
-    );
-  }
-
-  return data as T;
-}
-
-export async function compressImageToDataUrl(file: File, maxSize = 320): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const img = new Image();
-      img.onload = () => {
-        const canvas = document.createElement('canvas');
-        const ratio = Math.min(maxSize / img.width, maxSize / img.height, 1);
-        const w = Math.max(1, Math.round(img.width * ratio));
-        const h = Math.max(1, Math.round(img.height * ratio));
-        canvas.width = w;
-        canvas.height = h;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) {
-          reject(new Error('Falha ao processar imagem.'));
-          return;
-        }
-        ctx.drawImage(img, 0, 0, w, h);
-        resolve(canvas.toDataURL('image/jpeg', 0.82));
-      };
-      img.onerror = () => reject(new Error('Arquivo de imagem inválido.'));
-      img.src = String(reader.result);
-    };
-    reader.onerror = () => reject(new Error('Falha ao ler arquivo.'));
-    reader.readAsDataURL(file);
-  });
+  return (await response.json()) as T;
 }

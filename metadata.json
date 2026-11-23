@@ -1,6 +1,6 @@
 {
-  "name": "QuadraMestre — Controle de Pelada e Futsal",
-  "description": "Sistema completo de gestão de peladas de futebol de salão, separação de times, placar de vitórias, temporadas, estatísticas e avaliações em 7 critérios.",
+  "name": "QuadraMestre — Peladas Fixas da Semana",
+  "description": "Controle completo de peladas fixas semanais: membros, ficha de ingresso médica, notas distintas por pelada em 6 critérios, presença com prioridade para mensalistas, sorteio equilibrado de times e fluxo financeiro com comprovantes.",
   "requestFramePermissions": ["camera"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

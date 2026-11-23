@@ -1,69 +1,89 @@
-import type { Request, Response, NextFunction } from 'express';
+import type { NextFunction, Request, Response } from 'express';
 import { eq } from 'drizzle-orm';
-import { verifySessionToken } from '../lib/auth-crypto.ts';
 import { db } from '../db/index.ts';
-import { players, users } from '../db/schema.ts';
+import { users } from '../db/schema.ts';
+import { verifySessionToken } from '../lib/auth-crypto.ts';
+import type { AuthUser, UserRole } from '../types/pelada.ts';
 
-export interface AuthenticatedUser {
-  id: number;
-  uid: string;
-  email: string;
-  name: string;
-  role: 'admin' | 'player';
-  playerId: number | null;
+declare global {
+  namespace Express {
+    interface Request {
+      authUser?: AuthUser;
+    }
+  }
 }
 
-export interface AuthRequest extends Request {
-  authUser?: AuthenticatedUser;
+function extractBearerToken(req: Request): string | null {
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith('Bearer ')) return null;
+  return header.slice(7).trim() || null;
 }
 
-export const requireAuth = async (req: AuthRequest, res: Response, next: NextFunction) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Autenticação necessária. Faça login para continuar.' });
-  }
-
-  const token = authHeader.slice('Bearer '.length).trim();
-  if (!token) {
-    return res.status(401).json({ error: 'Token de autenticação inválido.' });
-  }
-
+export async function attachAuthIfPresent(
+  req: Request,
+  _res: Response,
+  next: NextFunction
+): Promise<void> {
   try {
-    const session = verifySessionToken(token);
-    if (!session) {
-      return res.status(401).json({ error: 'Sessão expirada ou inválida. Entre novamente.' });
+    const token = extractBearerToken(req);
+    if (!token) {
+      next();
+      return;
     }
-
-    const found = await db.select().from(users).where(eq(users.id, session.userId)).limit(1);
-    if (found.length === 0 || !found[0].active) {
-      return res.status(401).json({ error: 'Usuário não encontrado ou inativo.' });
+    const payload = verifySessionToken(token);
+    if (!payload) {
+      next();
+      return;
     }
-
-    const u = found[0];
-    const linkedPlayer = await db
-      .select({ id: players.id })
-      .from(players)
-      .where(eq(players.userId, u.id))
+    const [userRow] = await db
+      .select({
+        id: users.id,
+        email: users.email,
+        name: users.name,
+        role: users.role,
+        active: users.active,
+      })
+      .from(users)
+      .where(eq(users.id, payload.uid))
       .limit(1);
 
-    req.authUser = {
-      id: u.id,
-      uid: u.uid,
-      email: u.email,
-      name: u.name,
-      role: u.role === 'admin' ? 'admin' : 'player',
-      playerId: linkedPlayer[0]?.id ?? null,
-    };
-    return next();
-  } catch (error) {
-    console.error('Erro na verificação da sessão:', error);
-    return res.status(401).json({ error: 'Sessão inválida ou expirada.' });
+    if (userRow && userRow.active) {
+      req.authUser = {
+        id: userRow.id,
+        email: userRow.email,
+        name: userRow.name,
+        role: userRow.role as UserRole,
+        active: userRow.active,
+      };
+    }
+    next();
+  } catch {
+    next();
   }
-};
+}
 
-export const requireAdmin = (req: AuthRequest, res: Response, next: NextFunction) => {
-  if (!req.authUser || req.authUser.role !== 'admin') {
-    return res.status(403).json({ error: 'Acesso restrito a administradores.' });
+export async function requireAuth(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  await attachAuthIfPresent(req, res, () => {
+    if (!req.authUser) {
+      res.status(401).json({ error: 'Autenticação necessária. Faça login para continuar.' });
+      return;
+    }
+    next();
+  });
+}
+
+export function requireAdmin(req: Request, res: Response, next: NextFunction): void {
+  if (!req.authUser) {
+    res.status(401).json({ error: 'Autenticação necessária.' });
+    return;
   }
-  return next();
-};
+  if (req.authUser.role !== 'admin') {
+    res.status(403).json({ error: 'Acesso restrito a administradores da pelada.' });
+    return;
+  }
+  next();
+}
